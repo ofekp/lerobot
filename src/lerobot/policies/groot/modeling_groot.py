@@ -78,6 +78,8 @@ class GrootPolicy(PreTrainedPolicy):
             tune_visual=self.config.tune_visual,
             tune_projector=self.config.tune_projector,
             tune_diffusion_model=self.config.tune_diffusion_model,
+            use_depth=self.config.use_depth,
+            depth_weight_init=self.config.depth_weight_init,
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype

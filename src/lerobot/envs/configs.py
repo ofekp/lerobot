@@ -269,6 +269,8 @@ class LiberoEnv(EnvConfig):
     camera_name_mapping: dict[str, str] | None = None
     observation_height: int = 360
     observation_width: int = 360
+    # Depth support for RGB-D evaluation
+    use_depth: bool = False
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -289,6 +291,7 @@ class LiberoEnv(EnvConfig):
         }
     )
     control_mode: str = "relative"  # or "absolute"
+    gym_kwargs: dict | None = None  # Can be overridden from CLI, e.g., {"task_ids": [5]}
 
     def __post_init__(self):
         if self.obs_type == "pixels":
@@ -336,12 +339,13 @@ class LiberoEnv(EnvConfig):
         else:
             raise ValueError(f"Unsupported obs_type: {self.obs_type}")
 
-    @property
-    def gym_kwargs(self) -> dict:
-        return {
-            "obs_type": self.obs_type,
-            "render_mode": self.render_mode,
-        }
+        # Initialize gym_kwargs with defaults if not provided from CLI
+        if not hasattr(self, '_gym_kwargs_set'):
+            if not hasattr(self, 'gym_kwargs') or self.gym_kwargs is None:
+                self.gym_kwargs = {}
+            # Set defaults if not overridden
+            self.gym_kwargs.setdefault("obs_type", self.obs_type)
+            self.gym_kwargs.setdefault("render_mode", self.render_mode)
 
 
 @EnvConfig.register_subclass("metaworld")

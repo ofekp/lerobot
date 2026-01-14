@@ -131,6 +131,7 @@ def make_groot_pre_post_processors(
         # 2. Add batch dimension for single samples
         AddBatchDimensionProcessorStep(),
         # 3. Pack video/state/action/language/embodiment; apply optional min-max normalization before padding
+        # Depth is kept separate from RGB for late fusion
         GrootPackInputsStep(
             state_horizon=state_horizon,
             action_horizon=action_horizon,
@@ -141,14 +142,18 @@ def make_groot_pre_post_processors(
             embodiment_tag=config.embodiment_tag,
             normalize_min_max=True,
             stats=padded_stats,
+            use_depth=getattr(config, 'use_depth', False),
         ),
-        # 4. Eagle encode (creates eagle_content)
+        # 4. Eagle encode RGB images (creates eagle_content), depth passes through unchanged
         GrootEagleEncodeStep(
             tokenizer_assets_repo=config.tokenizer_assets_repo,
         ),
-        # 5. Collate eagle_content -> eagle_* tensors
+        # 5. Collate eagle_content -> eagle_* tensors, then concatenate depth with RGB pixel_values
         GrootEagleCollateStep(
             tokenizer_assets_repo=config.tokenizer_assets_repo,
+            depth_scale=getattr(config, 'depth_scale', 0.001),
+            depth_mean=getattr(config, 'depth_mean', 0.5),
+            depth_std=getattr(config, 'depth_std', 0.5),
         ),
         # 6. Move to device
         DeviceProcessorStep(device=config.device),
@@ -187,6 +192,37 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
     if img_t.dtype.is_floating_point:
         img_t = (img_t.clamp(0, 1) * 255.0).to(torch.uint8)
     return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
+
+
+def _prepare_depth_tensor(depth_t: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Prepare depth tensor for late fusion with RGB.
+    
+    Keeps depth values unnormalized (preserving metric depth information).
+    Only reshapes and resizes to match RGB spatial dimensions.
+    
+    Args:
+        depth_t: Depth tensor of shape (B, 1, H, W) or (B, H, W), any dtype
+        target_h: Target height to match RGB
+        target_w: Target width to match RGB
+        
+    Returns:
+        torch.Tensor of shape (B, 1, H, W) as float32, unnormalized
+    """
+    # Handle different input shapes
+    if depth_t.dim() == 3:  # (B, H, W)
+        depth_t = depth_t.unsqueeze(1)  # (B, 1, H, W)
+    
+    # Convert to float32 if needed (preserve actual values)
+    depth_t = depth_t.to(torch.float32)
+    
+    # Resize if needed to match RGB dimensions
+    b, c, h, w = depth_t.shape
+    if h != target_h or w != target_w:
+        depth_t = torch.nn.functional.interpolate(
+            depth_t, size=(target_h, target_w), mode='nearest'
+        )
+    
+    return depth_t.cpu()
 
 
 def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
@@ -228,6 +264,8 @@ class GrootPackInputsStep(ProcessorStep):
             "unitree_g1": 3,
         }
     )
+    # Depth modality augmentation support (paper: "Modality-Augmented Fine-Tuning")
+    use_depth: bool = False
     # Min-max normalization (SO100-like) applied BEFORE padding
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
@@ -267,20 +305,62 @@ class GrootPackInputsStep(ProcessorStep):
             mapped = 2 * (x - min_v) / safe_denom - 1
             return torch.where(mask, mapped, torch.zeros_like(mapped))
 
-        # 1) Video (B, T=1, V, H, W, C) uint8
-        img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
+        # 1) Video (B, T=1, V, C, H, W) uint8 - RGB only
+        # Depth is kept separate and concatenated AFTER Eagle processing
+        img_keys = sorted([k for k in obs if k.startswith("observation.images.") and "depth" not in k.lower()])
         if not img_keys and "observation.image" in obs:
             img_keys = ["observation.image"]
+        
         if img_keys:
-            cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
-            video = np.stack(cams, axis=1)  # (B, V, H, W, C)
-            video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C)
-            # GR00T validates that video.shape[3] == 3 (channels), so reorder to (B, T, V, C, H, W)
-            video = np.transpose(video, (0, 1, 2, 5, 3, 4))  # (B, 1, V, C, H, W)
+            cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]  # List of (B, H, W, 3)
+            b, h, w, _ = cams[0].shape  # Get spatial dims from first camera
+            
+            # Handle depth: keep separate for late fusion (after Eagle RGB processing)
+            if self.use_depth:
+                # Find depth images based on the img_keys
+                depth_keys = []
+                found_depth = False
+                # TODO(ofekp): note that this means we do not support depth streams that have no corresponding RGB steam
+                for img_key in img_keys:
+                    if img_key == "observation.image":
+                        assert "observation.depth" in obs, "[GROOT] Error: depth_key not found in observations."
+                        depth_keys.append("observation.depth")
+                        found_depth = True
+                        break
+                    depth_key = img_key.replace("images.", "depth.")
+                    if depth_key in obs:
+                        found_depth = True
+                        depth_keys.append(depth_key)
+                    else:
+                        depth_keys.append(None)  # indicates that this camera stream has no depth
+
+                if not depth_keys or len(depth_keys) == 0:
+                    raise Exception("[GROOT] Warning: use_depth=True but no depth images found. Using RGB only.")
+                
+                # Prepare depth tensors (unnormalized, just resized to match RGB)
+                # TODO(ofekp): take care of the device when torch.zeros is called e.g. device=next(iter(obs.values())).device
+                # import pdb; pdb.set_trace()
+                depth_tensors = [_prepare_depth_tensor(obs[k], h, w) if k is not None else torch.zeros((b, 1, h, w)).cpu() for k in depth_keys]  # List of (B, 1, H, W)
+                
+                # Stack depth tensors: (B, V, 1, H, W) where V = num cameras
+                depth_stacked = torch.stack(depth_tensors, dim=1)  # (B, V, 1, H, W)
+                depth_stacked = depth_stacked.unsqueeze(1)  # (B, 1, V, 1, H, W) to match video T dim
+                obs["depth_raw"] = depth_stacked  # Keep for late fusion
+                    
+            # Create RGB-only video (depth will be concatenated after Eagle processing)
+            video = np.stack(cams, axis=1)  # (B, V, H, W, 3)
+            video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, 3)
+            # Reorder to (B, T, V, C, H, W) - always C=3 for RGB
+            video = np.transpose(video, (0, 1, 2, 5, 3, 4))  # (B, 1, V, 3, H, W)
             obs["video"] = video
             # Drop raw images to avoid confusion downstream
             for k in img_keys:
                 obs.pop(k, None)
+            # Drop original depth keys (we've stored processed depth in depth_raw)
+            if self.use_depth:
+                for k in list(obs.keys()):
+                    if "depth" in k.lower() and k != "depth_raw":
+                        obs.pop(k, None)
 
         # 2) Language (string)
         lang = comp.get(self.language_key)
@@ -449,7 +529,8 @@ class GrootEagleEncodeStep(ProcessorStep):
         if "video" not in obs:
             return transition
 
-        video = obs["video"]  # (B, T, V, H, W, C) uint8
+        video = obs["video"]  # (B, T, V, C, H, W) uint8, C=3 (RGB only)
+        assert video.shape[3] == 3, f"[GROOT] Expected RGB video with 3 channels, got {video.shape[3]} channels."
         lang = comp.get("language", "Perform the task.")
         if isinstance(lang, list):
             lang = lang[0] if len(lang) > 0 else "Perform the task."
@@ -465,6 +546,7 @@ class GrootEagleEncodeStep(ProcessorStep):
             else:
                 t, v, c, h, w = vt.shape
                 flat = rearrange(vt, "t v c h w -> (t v) h w c")
+            # Create PIL images from RGB (3-channel) data only
             images = [Image.fromarray(flat[i]) for i in range(t * v)]
             # Format language as string list representation to match Original GROOT
             lang_formatted = str([lang])
@@ -482,6 +564,7 @@ class GrootEagleEncodeStep(ProcessorStep):
             )
 
         comp["eagle_content"] = eagle_contents
+        # Pass through depth_raw unchanged for late fusion in collate step
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
         return transition
@@ -502,11 +585,26 @@ def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> 
         if key == "eagle_content":
             text_list: list[str] = []
             image_inputs: list[Any] = []
+            # DEBUG(ofekp):
+            # len(values) == 3 - this is the batch size
+            # values[2]["image_inputs"][0].getpixel((100,100)) --> (185, 183, 177)
             for v in values:
                 curr_text_list = v["text_list"]
                 curr_image_inputs = v["image_inputs"]
                 text_list += curr_text_list
                 image_inputs += curr_image_inputs
+            # eagle_processor is of type Eagle25VLProcessor
+            # contains image_processor of type Eagle25VLImageProcessorFast with params:
+            # do_convert_rgb = true
+            # do_normalize = true
+            # do_rescale = true
+            # do_resize = false
+            # data_format = "channels_first"
+            # image_mean = [0.5, 0.5, 0.5]
+            # tokens_per_tile = 256
+            # use_thumbnail = true
+            # tokenizer is Qwen2TokenizerFast
+            # most likely the scaling happens in the func `rescale_and_normalize` (see https://github.com/huggingface/transformers/blob/main/src/transformers/image_processing_utils_fast.py#L558)
             eagle_inputs = eagle_processor(
                 text=text_list,
                 images=image_inputs,
@@ -517,6 +615,11 @@ def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> 
             for k, v in eagle_inputs.items():
                 k = "eagle_" + k
                 batch[k] = v
+            # DEBUG(ofekp):
+            # batch.keys() --> ['eagle_input_ids', 'eagle_attention_mask', 'eagle_pixel_values', 'eagle_image_sizes']
+            # batch["eagle_pixel_values"].shape --> torch.Size([3, 3, 224, 224]) which is b,c,h,w
+            # batch["eagle_pixel_values"][2][:,10,100] --> tensor([0.5373, 0.5059, 0.4588])
+            # batch["eagle_pixel_values"][2][:,100,100] --> tensor([-0.0196, -0.0196, -0.0196])
         elif key in ("pixel_values", "image_grid_thw", "attention_mask", "input_ids"):
             # Concat in existing batch dimension.
             batch[key] = torch.cat(values)
@@ -527,10 +630,46 @@ def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> 
     return batch
 
 
+def _normalize_depth_for_fusion(
+    depth: torch.Tensor,
+    depth_scale: float = 1.0,
+    depth_mean: float = 0.5,
+    depth_std: float = 0.5,
+) -> torch.Tensor:
+    """Normalize depth tensor to match the scale of Eagle-processed RGB.
+    
+    Eagle RGB processing: pixel_values are normalized with ImageNet stats,
+    resulting in values roughly in [-2, 2] range.
+    
+    For depth, we apply a simple linear normalization:
+    1. Scale raw depth by depth_scale (e.g., 1/1000 for mm->m, or 1/10 for m->normalized)
+    2. Apply (depth - mean) / std to center around 0
+    
+    Args:
+        depth: Raw depth tensor (B, 1, H, W) in original units (mm or m)
+        depth_scale: Scale factor to apply to raw depth (default 1.0 = no scaling)
+        depth_mean: Mean for normalization (default 0.5)
+        depth_std: Std for normalization (default 0.5)
+        
+    Returns:
+        Normalized depth tensor suitable for concatenation with RGB pixel_values
+    """
+    # Apply scale (e.g., convert mm to meters, or normalize to expected range)
+    depth_scaled = depth * depth_scale
+    # Normalize similar to how RGB is normalized
+    depth_normalized = (depth_scaled - depth_mean) / depth_std
+    return depth_normalized
+
+
 @dataclass
 @ProcessorStepRegistry.register(name="groot_eagle_collate_v3")
 class GrootEagleCollateStep(ProcessorStep):
     tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO
+    # Depth normalization parameters for late fusion
+    # Set depth_scale based on your depth units: 1/1000 for mm, 1/10 for m (to get ~[0,1] range)
+    depth_scale: float = 0.001  # Default assumes depth in mm, converts to meters
+    depth_mean: float = 0.5  # Center depth around 0 after scaling
+    depth_std: float = 0.5   # Scale to roughly match RGB normalized range
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
     @property
@@ -554,6 +693,46 @@ class GrootEagleCollateStep(ProcessorStep):
         for k, v in batched.items():
             comp[k] = v
         comp.pop("eagle_content", None)
+        
+        # Late fusion: concatenate depth with RGB pixel_values if depth_raw exists
+        depth_raw = obs.get("depth_raw")
+        if depth_raw is not None and "eagle_pixel_values" in comp:
+            # depth_raw: (B, 1, V, 1, H, W) - raw depth values
+            # eagle_pixel_values: (N, 3, H', W') where N = B * T * V, normalized RGB
+            pixel_values = comp["eagle_pixel_values"]  # (N, 3, H', W')
+            n, c, h_pv, w_pv = pixel_values.shape  # [3, 3, 224, 224]
+            
+            # Reshape depth to match pixel_values layout
+            # depth_raw is (B, T=1, V, 1, H, W), we need (N, 1, H', W')
+            b, t, v, _, h_d, w_d = depth_raw.shape  # [3, 1, 1, 1, 256, 256]
+            depth_flat = depth_raw.view(b * t * v, 1, h_d, w_d)  # (N, 1, H, W)
+
+            assert depth_flat.shape[0] == pixel_values.shape[0]
+            
+            # Resize depth to match pixel_values spatial dims if needed
+            # even though we already matched the depth to the rgb, the rgb is resized inside eagle processor
+            # this resize happens inside the `collate(features, self.proc)` call above
+            if h_d != h_pv or w_d != w_pv:
+                depth_flat = torch.nn.functional.interpolate(
+                    depth_flat, size=(h_pv, w_pv), mode='nearest'
+                )
+            
+            # Normalize depth for fusion (converts raw values to normalized scale)
+            depth_normalized = _normalize_depth_for_fusion(
+                depth_flat,
+                depth_scale=self.depth_scale,
+                depth_mean=self.depth_mean,
+                depth_std=self.depth_std,
+            )
+            
+            # Concatenate depth as 4th channel: (N, 4, H', W')
+            # TODO(ofekp): verify that cam-depth alignment is correct
+            pixel_values_rgbd = torch.cat([pixel_values, depth_normalized], dim=1)
+            comp["eagle_pixel_values"] = pixel_values_rgbd
+            
+            # Clean up depth_raw
+            obs.pop("depth_raw", None)
+        
         obs.pop(
             "video", None
         )  # The video has been fully encoded into eagle_* tensors, so we don't need the raw video anymore

@@ -484,7 +484,7 @@ class Eagle25VLProcessor(ProcessorMixin):
             if "image" in vision_info or "image_url" in vision_info:
                 image_inputs.append(fetch_image(vision_info))
             else:
-                raise ValueError("image, image_url or video should in content.")
+                raise ValueError("image, image_url or video should be in the content.")
         if len(image_inputs) == 0:
             image_inputs = None
         if len(video_inputs) == 0:

@@ -180,6 +180,8 @@ def make_env(
             env_cls=env_cls,
             control_mode=cfg.control_mode,
             episode_length=cfg.episode_length,
+            use_depth=cfg.use_depth,
+            camera_name_mapping=cfg.camera_name_mapping,
         )
     elif "metaworld" in cfg.type:
         from lerobot.envs.metaworld import create_metaworld_envs

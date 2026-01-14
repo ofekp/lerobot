@@ -113,6 +113,7 @@ class LiberoEnv(gym.Env):
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
         control_mode: str = "relative",
+        use_depth: bool = False,
     ):
         super().__init__()
         self.task_id = task_id
@@ -123,16 +124,18 @@ class LiberoEnv(gym.Env):
         self.visualization_width = visualization_width
         self.visualization_height = visualization_height
         self.init_states = init_states
+        self.use_depth = use_depth
         self.camera_name = _parse_camera_names(
             camera_name
         )  # agentview_image (main) or robot0_eye_in_hand_image (wrist)
 
-        # Map raw camera names to "image1" and "image2".
+        # Map raw camera names to "image" and "image2".
         # The preprocessing step `preprocess_observation` will then prefix these with `.images.*`,
         # following the LeRobot convention (e.g., `observation.images.image`, `observation.images.image2`).
         # This ensures the policy consistently receives observations in the
         # expected format regardless of the original camera naming.
-        if camera_name_mapping is None:
+        if camera_name_mapping is None or not camera_name_mapping:
+            # Default mapping for standard LIBERO camera setup
             camera_name_mapping = {
                 "agentview_image": "image",
                 "robot0_eye_in_hand_image": "image2",
@@ -154,6 +157,7 @@ class LiberoEnv(gym.Env):
         )
         self.control_mode = control_mode
         images = {}
+        depths = {}
         for cam in self.camera_name:
             images[self.camera_name_mapping[cam]] = spaces.Box(
                 low=0,
@@ -161,6 +165,14 @@ class LiberoEnv(gym.Env):
                 shape=(self.observation_height, self.observation_width, 3),
                 dtype=np.uint8,
             )
+            # Add depth space if depth is enabled
+            if self.use_depth:
+                depths[self.camera_name_mapping[cam]] = spaces.Box(
+                    low=0,
+                    high=65535,  # uint16 max value (millimeters)
+                    shape=(self.observation_height, self.observation_width),
+                    dtype=np.uint16,
+                )
 
         if self.obs_type == "state":
             raise NotImplementedError(
@@ -169,48 +181,48 @@ class LiberoEnv(gym.Env):
             )
 
         elif self.obs_type == "pixels":
-            self.observation_space = spaces.Dict(
-                {
-                    "pixels": spaces.Dict(images),
-                }
-            )
+            obs_space = {"pixels": spaces.Dict(images)}
+            if self.use_depth and depths:
+                obs_space["depths"] = spaces.Dict(depths)
+            self.observation_space = spaces.Dict(obs_space)
         elif self.obs_type == "pixels_agent_pos":
-            self.observation_space = spaces.Dict(
-                {
-                    "pixels": spaces.Dict(images),
-                    "robot_state": spaces.Dict(
-                        {
-                            "eef": spaces.Dict(
-                                {
-                                    "pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float64),
-                                    "quat": spaces.Box(
-                                        low=-np.inf, high=np.inf, shape=(4,), dtype=np.float64
-                                    ),
-                                    "mat": spaces.Box(
-                                        low=-np.inf, high=np.inf, shape=(3, 3), dtype=np.float64
-                                    ),
-                                }
-                            ),
-                            "gripper": spaces.Dict(
-                                {
-                                    "qpos": spaces.Box(
-                                        low=-np.inf, high=np.inf, shape=(2,), dtype=np.float64
-                                    ),
-                                    "qvel": spaces.Box(
-                                        low=-np.inf, high=np.inf, shape=(2,), dtype=np.float64
-                                    ),
-                                }
-                            ),
-                            "joints": spaces.Dict(
-                                {
-                                    "pos": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float64),
-                                    "vel": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float64),
-                                }
-                            ),
-                        }
-                    ),
-                }
-            )
+            obs_space = {
+                "pixels": spaces.Dict(images),
+                "robot_state": spaces.Dict(
+                    {
+                        "eef": spaces.Dict(
+                            {
+                                "pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float64),
+                                "quat": spaces.Box(
+                                    low=-np.inf, high=np.inf, shape=(4,), dtype=np.float64
+                                ),
+                                "mat": spaces.Box(
+                                    low=-np.inf, high=np.inf, shape=(3, 3), dtype=np.float64
+                                ),
+                            }
+                        ),
+                        "gripper": spaces.Dict(
+                            {
+                                "qpos": spaces.Box(
+                                    low=-np.inf, high=np.inf, shape=(2,), dtype=np.float64
+                                ),
+                                "qvel": spaces.Box(
+                                    low=-np.inf, high=np.inf, shape=(2,), dtype=np.float64
+                                ),
+                            }
+                        ),
+                        "joints": spaces.Dict(
+                            {
+                                "pos": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float64),
+                                "vel": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float64),
+                            }
+                        ),
+                    }
+                ),
+            }
+            if self.use_depth and depths:
+                obs_space["depths"] = spaces.Dict(depths)
+            self.observation_space = spaces.Dict(obs_space)
 
         self.action_space = spaces.Box(
             low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32
@@ -219,7 +231,7 @@ class LiberoEnv(gym.Env):
     def render(self):
         raw_obs = self._env.env._get_observations()
         image = self._format_raw_obs(raw_obs)["pixels"]["image"]
-        image = image[::-1, ::-1]  # flip both H and W for visualization
+        # No flip needed - already handled in _format_raw_obs
         return image
 
     def _make_envs_task(self, task_suite: Any, task_id: int = 0):
@@ -228,10 +240,16 @@ class LiberoEnv(gym.Env):
         self.task_description = task.language
         task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
 
+        # Extract base camera names (without _image suffix) for robosuite
+        # e.g., "frontview_image" -> "frontview"
+        camera_names_for_env = [cam.replace("_image", "") for cam in self.camera_name]
+        
         env_args = {
             "bddl_file_name": task_bddl_file,
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
+            "camera_depths": self.use_depth,  # Enable depth rendering
+            "camera_names": camera_names_for_env,  # Specify which cameras to render
         }
         env = OffScreenRenderEnv(**env_args)
         env.reset()
@@ -239,9 +257,31 @@ class LiberoEnv(gym.Env):
 
     def _format_raw_obs(self, raw_obs: dict[str, Any]) -> dict[str, Any]:
         images = {}
+        depths = {}
         for camera_name in self.camera_name:
             image = raw_obs[camera_name]
+            # LIBERO/robosuite images are rotated 180° - flip both H and W to match training data orientation
+            image = image[::-1, ::-1]
             images[self.camera_name_mapping[camera_name]] = image
+            
+            # Handle depth if enabled
+            # Note: robosuite renders depth for ALL cameras when camera_depths=True
+            # We extract only the cameras specified in self.camera_name
+            if self.use_depth:
+                # LIBERO/robosuite depth keys are camera_name with "_depth" suffix
+                # e.g., "agentview_image" -> "agentview_depth"
+                depth_key = camera_name.replace("_image", "_depth")
+                if depth_key in raw_obs:
+                    depth = raw_obs[depth_key]
+                    # Robosuite depth is (H, W, 1) - squeeze to (H, W)
+                    if depth.ndim == 3 and depth.shape[2] == 1:
+                        depth = depth.squeeze(-1)
+                    # Flip depth to match image orientation
+                    depth = depth[::-1, ::-1]
+                    # Depth from robosuite is (H, W) float array in meters
+                    # Convert to uint16 millimeters for consistency with LeRobot dataset format
+                    depth_mm = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
+                    depths[self.camera_name_mapping[camera_name]] = depth_mm
 
         eef_pos = raw_obs.get("robot0_eef_pos")
         eef_quat = raw_obs.get("robot0_eef_quat")
@@ -270,8 +310,18 @@ class LiberoEnv(gym.Env):
                 },
             },
         }
+        
+        import pdb; pdb.set_trace()
+
+        # Add depth observations if available
+        if self.use_depth and depths:
+            obs["depths"] = depths
+        
         if self.obs_type == "pixels":
-            return {"pixels": images.copy()}
+            result = {"pixels": images.copy()}
+            if self.use_depth and depths:
+                result["depths"] = depths.copy()
+            return result
 
         if self.obs_type == "pixels_agent_pos":
             # Validate required fields are present
@@ -393,6 +443,8 @@ def create_libero_envs(
     env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None = None,
     control_mode: str = "relative",
     episode_length: int | None = None,
+    use_depth: bool = False,
+    camera_name_mapping: dict[str, str] | None = None,
 ) -> dict[str, dict[int, Any]]:
     """
     Create vectorized LIBERO environments with a consistent return shape.
@@ -411,6 +463,10 @@ def create_libero_envs(
 
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
+    # Add use_depth and camera_name_mapping to gym_kwargs so they get passed to LiberoEnv.__init__
+    gym_kwargs["use_depth"] = use_depth
+    if camera_name_mapping is not None:
+        gym_kwargs["camera_name_mapping"] = camera_name_mapping
 
     camera_names = _parse_camera_names(camera_name)
     suite_names = [s.strip() for s in str(task).split(",") if s.strip()]

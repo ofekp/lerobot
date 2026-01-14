@@ -759,13 +759,12 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
     # TODO(aliberts): Implement "type" in dataset features and simplify this
     policy_features = {}
     for key, ft in features.items():
-        shape = ft["shape"]
-        if ft["dtype"] in ["image", "video", "depth"]:
+        shape = ft["shape"]  # (3, 256, 256)
+        if ft["dtype"] in ["image", "video", "depth"]:  # image
             type = FeatureType.VISUAL
             if len(shape) != 3:
                 raise ValueError(f"Number of dimensions of {key} != 3 (shape={shape})")
-
-            names = ft["names"]
+            names = ft["names"]  # "rgb"
             # Backward compatibility for "channel" which is an error introduced in LeRobotDataset v2.0 for ported datasets.
             if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
                 shape = (shape[2], shape[0], shape[1])
