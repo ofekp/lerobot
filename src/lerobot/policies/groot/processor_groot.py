@@ -323,11 +323,11 @@ class GrootPackInputsStep(ProcessorStep):
                 # TODO(ofekp): note that this means we do not support depth streams that have no corresponding RGB steam
                 for img_key in img_keys:
                     if img_key == "observation.image":
-                        assert "observation.depth" in obs, "[GROOT] Error: depth_key not found in observations."
-                        depth_keys.append("observation.depth")
+                        assert "observation.image.depth" in obs, "[GROOT] Error: depth_key not found in observations."
+                        depth_keys.append("observation.image.depth")
                         found_depth = True
                         break
-                    depth_key = img_key.replace("images.", "depth.")
+                    depth_key = [f"{img_key}.depth" for img_key in img_key]
                     if depth_key in obs:
                         found_depth = True
                         depth_keys.append(depth_key)

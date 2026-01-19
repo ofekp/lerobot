@@ -115,10 +115,8 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
                 
                 # Convert uint16 mm to float32 meters
                 depth_tensor = depth_tensor.to(torch.float32) / 1000.0
-                # TODO(ofekp): print depth tensor and make sure it is in meters (random print)
                 if torch.rand(1).item() < 0.001:
                     print(f"Depth tensor (meters): {depth_tensor}")
-                import pdb; pdb.set_trace()
 
                 # Match the RGB naming convention:
                 # If we have observation.images.image -> use observation.depth.image
@@ -126,11 +124,11 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
                 # TODO(ofekp): later, consider:
                 #   If we have observation.images.image -> use observation.images.image.depth
                 #   If we have observation.image (single) -> use observation.image.depth
-                if len(observations["depths"]) == 1 and key == "image":
-                    # Single camera case - use observation.depth (no suffix)
-                    return_observations["observation.depth"] = depth_tensor
+                if len(observations["depths"]) == 1 and key == "image.depth":
+                    # Single camera case - use observation.image.depth (no suffix)
+                    return_observations[f"observation.{key}"] = depth_tensor
                 else:
-                    return_observations[f"observation.depth.{key}"] = depth_tensor
+                    return_observations[f"observation.images.{key}"] = depth_tensor
         else:
             # Single depth: just observation.depth
             depth_tensor = torch.from_numpy(observations["depths"])
@@ -139,7 +137,7 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
             elif depth_tensor.ndim == 3:
                 depth_tensor = depth_tensor.unsqueeze(1)
             depth_tensor = depth_tensor.to(torch.float32) / 1000.0
-            return_observations["observation.depth"] = depth_tensor
+            return_observations["observation.image.depth"] = depth_tensor
 
     if "environment_state" in observations:
         env_state = torch.from_numpy(observations["environment_state"]).float()

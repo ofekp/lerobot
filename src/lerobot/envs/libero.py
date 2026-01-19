@@ -167,7 +167,8 @@ class LiberoEnv(gym.Env):
             )
             # Add depth space if depth is enabled
             if self.use_depth:
-                depths[self.camera_name_mapping[cam]] = spaces.Box(
+                depth_key = cam.replace("_image", "_depth")
+                depths[self.camera_name_mapping[depth_key]] = spaces.Box(
                     low=0,
                     high=65535,  # uint16 max value (millimeters)
                     shape=(self.observation_height, self.observation_width),
@@ -182,7 +183,7 @@ class LiberoEnv(gym.Env):
 
         elif self.obs_type == "pixels":
             obs_space = {"pixels": spaces.Dict(images)}
-            if self.use_depth and depths:
+            if self.use_depth:
                 obs_space["depths"] = spaces.Dict(depths)
             self.observation_space = spaces.Dict(obs_space)
         elif self.obs_type == "pixels_agent_pos":
@@ -231,7 +232,9 @@ class LiberoEnv(gym.Env):
     def render(self):
         raw_obs = self._env.env._get_observations()
         image = self._format_raw_obs(raw_obs)["pixels"]["image"]
-        # No flip needed - already handled in _format_raw_obs
+        # image = image[::-1, ::-1]  # flip both H and W for visualization
+        image = image[::-1, :, :]
+        assert image.shape[2] == 3
         return image
 
     def _make_envs_task(self, task_suite: Any, task_id: int = 0):
@@ -258,10 +261,12 @@ class LiberoEnv(gym.Env):
     def _format_raw_obs(self, raw_obs: dict[str, Any]) -> dict[str, Any]:
         images = {}
         depths = {}
+        should_flip = False
         for camera_name in self.camera_name:
             image = raw_obs[camera_name]
             # LIBERO/robosuite images are rotated 180° - flip both H and W to match training data orientation
-            image = image[::-1, ::-1]
+            if should_flip:
+                image = image[::-1, ::-1]
             images[self.camera_name_mapping[camera_name]] = image
             
             # Handle depth if enabled
@@ -277,11 +282,14 @@ class LiberoEnv(gym.Env):
                     if depth.ndim == 3 and depth.shape[2] == 1:
                         depth = depth.squeeze(-1)
                     # Flip depth to match image orientation
-                    depth = depth[::-1, ::-1]
+                    if should_flip:
+                        depth = depth[::-1, ::-1]
                     # Depth from robosuite is (H, W) float array in meters
                     # Convert to uint16 millimeters for consistency with LeRobot dataset format
                     depth_mm = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
-                    depths[self.camera_name_mapping[camera_name]] = depth_mm
+                    # Use same mapping key as RGB (camera_name, not depth_key)
+                    # so depths["image"] matches pixels["image"]
+                    depths[self.camera_name_mapping[depth_key]] = depth_mm
 
         eef_pos = raw_obs.get("robot0_eef_pos")
         eef_quat = raw_obs.get("robot0_eef_quat")
@@ -311,15 +319,17 @@ class LiberoEnv(gym.Env):
             },
         }
         
-        import pdb; pdb.set_trace()
-
         # Add depth observations if available
-        if self.use_depth and depths:
+        if self.use_depth:
             obs["depths"] = depths
-        
+
+        # images['image'].shape --> (256, 256, 3), uint8
+        # images['image.depth'].shape --> (256, 256), millimeters as uint16
+        # self.obs_type is "pixels_agent_pos"
+
         if self.obs_type == "pixels":
             result = {"pixels": images.copy()}
-            if self.use_depth and depths:
+            if self.use_depth:
                 result["depths"] = depths.copy()
             return result
 

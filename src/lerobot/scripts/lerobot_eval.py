@@ -172,6 +172,7 @@ def rollout(
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
 
+        # observation.keys() --> dict_keys(['action', 'next.reward', 'next.done', 'next.truncated', 'info', 'task', 'observation.image', 'observation.image.depth', 'observation.state'])
         observation = preprocessor(observation)
         with torch.inference_mode():
             action = policy.select_action(observation)
