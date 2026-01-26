@@ -28,6 +28,43 @@ import torch
 from gymnasium import spaces
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+import robosuite
+import libero
+import re
+
+
+def fix_resource_paths(xml_string):
+    if isinstance(xml_string, (bytes, np.bytes_)):
+        xml_string = xml_string.decode("utf-8")
+    
+    # 1. Get the absolute base paths for your current environment
+    rs_base = os.path.dirname(robosuite.__file__)
+    # Use __path__[0] if os.path.dirname comes up empty
+    libero_base = os.path.abspath(libero.__path__[0])
+
+    # 2. Fix Robosuite Paths
+    # Finds anything like ".../robosuite/models/assets/..." and points to local rs_base
+    xml_string = re.sub(r'\"/[^"]+/robosuite/models/', f'"{rs_base}/models/', xml_string)
+    
+    # 3. Fix LIBERO Paths
+    # LIBERO assets in the XML often look like ".../chiliocosm/assets/..."
+    # These map to your local LIBERO installation's assets folder
+    libero_assets_path = os.path.join(libero_base, "libero", "assets")
+    xml_string = re.sub(r'\"/[^"]+/chiliocosm/assets/', f'"{libero_assets_path}/', xml_string)
+    
+    # 4. Fix relative meshdir path to absolute path
+    # The XML has meshdir="meshes/" which is relative - MuJoCo needs absolute path
+    # LIBERO uses Panda robot, so meshes are in robosuite/models/assets/robots/panda/meshes/
+    robot_meshdir = os.path.join(rs_base, "models", "assets", "robots", "panda", "meshes")
+    xml_string = re.sub(r'meshdir="meshes/"', f'meshdir="{robot_meshdir}/"', xml_string)
+    
+    # 5. Final safety check: Replace any remaining /Users/yifengz/ with local paths
+    # (Just in case the regex missed a non-standard path)
+    if "/Users/yifengz/" in xml_string:
+        xml_string = xml_string.replace("/Users/yifengz/workspace/robosuite-master/robosuite/", rs_base + "/")
+        xml_string = xml_string.replace("/Users/yifengz/workspace/libero-dev/chiliocosm/assets/", libero_assets_path + "/")
+
+    return xml_string
 
 
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
@@ -78,6 +115,11 @@ def get_task_init_states(task_suite: Any, i: int) -> np.ndarray:
 def get_libero_dummy_action():
     """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
+
+
+def mujoco_depth_to_meters(z_buf, near, far):
+    """Convert MuJoCo's normalized z-buffer depth to actual depth in meters."""
+    return (near * far) / (far - z_buf * (far - near))
 
 
 ACTION_DIM = 7
@@ -231,10 +273,32 @@ class LiberoEnv(gym.Env):
 
     def render(self):
         raw_obs = self._env.env._get_observations()
-        image = self._format_raw_obs(raw_obs)["pixels"]["image"]
-        # image = image[::-1, ::-1]  # flip both H and W for visualization
-        image = image[::-1, :, :]
+        formatted_obs = self._format_raw_obs(raw_obs)
+        image = formatted_obs["pixels"]["image"]
+        image = image[::-1, ::-1]  # flip both H and W for visualization
         assert image.shape[2] == 3
+        
+        # If depth is enabled, visualize it side-by-side with RGB
+        if self.use_depth and "depths" in formatted_obs:
+            # Get depth for the same camera as the main image
+            # Assuming "image" key exists, look for corresponding depth
+            depth_key = None
+            for cam_name in self.camera_name:
+                if self.camera_name_mapping.get(cam_name) == "image":
+                    depth_key = self.camera_name_mapping.get(cam_name.replace("_image", "_depth"))
+                    break
+            if depth_key and depth_key in formatted_obs["depths"]:
+                depth = formatted_obs["depths"][depth_key]
+                depth = depth[::-1, ::-1]  # flip to match image orientation
+                # Normalize depth to 0-255 for visualization
+                # Clip to reasonable range (e.g., 0-5 meters = 0-5000mm)
+                depth_vis = np.clip(depth, 0, 5000)
+                depth_vis = (depth_vis / 5000.0 * 255).astype(np.uint8)
+                # Convert to RGB (grayscale colormap)
+                depth_rgb = np.stack([depth_vis, depth_vis, depth_vis], axis=-1)
+                # Concatenate horizontally: [RGB | Depth]
+                image = np.concatenate([image, depth_rgb], axis=1)
+        
         return image
 
     def _make_envs_task(self, task_suite: Any, task_id: int = 0):
@@ -267,6 +331,8 @@ class LiberoEnv(gym.Env):
             # LIBERO/robosuite images are rotated 180° - flip both H and W to match training data orientation
             if should_flip:
                 image = image[::-1, ::-1]
+            #image = image[:, ::-1, :]  # Flip W to match LeRobot dataset format
+            assert image.shape[2] == 3
             images[self.camera_name_mapping[camera_name]] = image
             
             # Handle depth if enabled
@@ -284,9 +350,45 @@ class LiberoEnv(gym.Env):
                     # Flip depth to match image orientation
                     if should_flip:
                         depth = depth[::-1, ::-1]
-                    # Depth from robosuite is (H, W) float array in meters
+                    
+                    # CRITICAL: Robosuite depth is in normalized z-buffer format (0-1), NOT meters!
+                    # Must convert using camera near/far planes to get actual depth in meters.
+                    # This matches what was done during training data collection in replay.py
+                    # new_sim = MjSim.from_xml_string(modified_xml)
+                    # # Manually initialize the offscreen rendering context
+                    # # This is necessary because MjSim.from_xml_string doesn't auto-init the renderer
+                    # render_context = MjRenderContextOffscreen(new_sim, device_id=-1) # -1 uses default/OSMesa
+                    # new_sim._render_context_offscreen = render_context
+
+                    sim = self._env.env.sim
+                    near = sim.model.vis.map.znear * sim.model.stat.extent
+                    far = sim.model.vis.map.zfar * sim.model.stat.extent
+                    # print(f"Near: {near}, Far: {far}, Extent: {sim.model.stat.extent}")
+                    depth_meters = mujoco_depth_to_meters(depth, near, far)
+
+                    # import h5py
+                    # from robosuite.utils.binding_utils import MjSim, MjRenderContextOffscreen
+                    # hdf5_path = "/data_host/libero_object/pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5"
+                    # modified_xml = None
+                    # with h5py.File(hdf5_path, "r") as f:
+                    #     # import pdb; pdb.set_trace()
+                    #     demo_group = f['data']['demo_0']
+                    #     model_xml = demo_group.attrs.get("model_file")
+                    #     modified_xml = fix_resource_paths(model_xml)
+                    # new_sim = MjSim.from_xml_string(modified_xml)
+                    # # Manually initialize the offscreen rendering context
+                    # # This is necessary because MjSim.from_xml_string doesn't auto-init the renderer
+                    # render_context = MjRenderContextOffscreen(new_sim, device_id=-1) # -1 uses default/OSMesa
+                    # new_sim._render_context_offscreen = render_context
+                    # near = new_sim.model.vis.map.znear * new_sim.model.stat.extent
+                    # far = new_sim.model.vis.map.zfar * new_sim.model.stat.extent
+                    # print(f"Near: {near}, Far: {far} Extent: {new_sim.model.stat.extent}")
+                    # depth_meters = mujoco_depth_to_meters(depth, near, far)
+
+                    # import pdb; pdb.set_trace()
+                    
                     # Convert to uint16 millimeters for consistency with LeRobot dataset format
-                    depth_mm = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
+                    depth_mm = np.clip(depth_meters * 1000.0, 0, 65535).astype(np.uint16)
                     # Use same mapping key as RGB (camera_name, not depth_key)
                     # so depths["image"] matches pixels["image"]
                     depths[self.camera_name_mapping[depth_key]] = depth_mm

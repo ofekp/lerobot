@@ -671,6 +671,7 @@ class GrootEagleCollateStep(ProcessorStep):
     depth_mean: float = 0.5  # Center depth around 0 after scaling
     depth_std: float = 0.5   # Scale to roughly match RGB normalized range
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
+    _logged_first_depth: bool = field(default=False, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
@@ -724,11 +725,115 @@ class GrootEagleCollateStep(ProcessorStep):
                 depth_mean=self.depth_mean,
                 depth_std=self.depth_std,
             )
-            
+
+            # our scaling is not doing anything on purpose (mean 0, std 1, scale 1) given in the cli command
+            # depth_flat == depth_normalized and are in meters
+
             # Concatenate depth as 4th channel: (N, 4, H', W')
             # TODO(ofekp): verify that cam-depth alignment is correct
             pixel_values_rgbd = torch.cat([pixel_values, depth_normalized], dim=1)
             comp["eagle_pixel_values"] = pixel_values_rgbd
+            
+            # Log depth stats for first frame only (deterministic, for comparison between runs)
+            if not self._logged_first_depth:
+                self._logged_first_depth = True
+                # First frame of first batch element
+                first_depth_raw = depth_flat[0, 0]  # RAW depth before normalization
+                first_depth = depth_normalized[0, 0]  # (H', W')
+                first_rgb = pixel_values[0]  # (3, H', W')
+                
+                # Check for suspicious patterns (all rows identical = likely bug)
+                unique_rows = torch.unique(first_depth_raw, dim=0).shape[0]
+                unique_cols = torch.unique(first_depth_raw, dim=1).shape[0]
+                
+                print(f"[GROOT DEPTH DEBUG RAW] Before normalization:")
+                print(f"  Shape: {first_depth_raw.shape}")
+                print(f"  Min: {first_depth_raw.min().item():.6f}, Max: {first_depth_raw.max().item():.6f}")
+                print(f"  Mean: {first_depth_raw.mean().item():.6f}, Std: {first_depth_raw.std().item():.6f}")
+                print(f"  Unique rows: {unique_rows}/{first_depth_raw.shape[0]}, Unique cols: {unique_cols}/{first_depth_raw.shape[1]}")
+                print(f"  Corner samples: TL={first_depth_raw[0,0].item():.6f}, TR={first_depth_raw[0,-1].item():.6f}, BL={first_depth_raw[-1,0].item():.6f}, BR={first_depth_raw[-1,-1].item():.6f}")
+                if unique_rows < 10:
+                    print(f"  WARNING: Only {unique_rows} unique rows - depth image may be corrupted!")
+                
+                print(first_depth)
+                print(f"[GROOT DEPTH DEBUG] First frame depth stats (normalized, before network):")
+                print(f"  Shape: {first_depth.shape}")
+                print(f"  Min: {first_depth.min().item():.6f}, Max: {first_depth.max().item():.6f}")
+                print(f"  Mean: {first_depth.mean().item():.6f}, Std: {first_depth.std().item():.6f}")
+                print(f"  Sample values [0,0]: {first_depth[0,0].item():.6f}, [H//2,W//2]: {first_depth[first_depth.shape[0]//2, first_depth.shape[1]//2].item():.6f}")
+                print(f"  RGB channel means: R={first_rgb[0].mean().item():.4f}, G={first_rgb[1].mean().item():.4f}, B={first_rgb[2].mean().item():.4f}")
+                
+                # Save depth and RGB images for visual comparison between train and eval
+                try:
+                    import os
+                    from PIL import Image as PILImage
+                    
+                    # Determine if this is training or eval based on model mode
+                    # During training, self.training would be True on the model, but we don't have direct access
+                    # Use a heuristic: check if we're in output_rgb or output_rgbd folder context
+                    mode_suffix = "unknown"
+                    # Try to detect from environment or just use timestamp to make unique
+                    import time
+                    timestamp = int(time.time())
+                    
+                    output_dir = "./output"
+                    os.makedirs(output_dir, exist_ok=True)
+                    
+                    # Save RAW depth (before normalization) - in meters, normalize to 0-255 for visualization
+                    depth_vis = first_depth_raw.cpu().numpy()
+                    # Clip to 0-5m range and normalize to 0-255
+                    depth_vis_clipped = np.clip(depth_vis, 0, 5.0)
+                    depth_vis_uint8 = (depth_vis_clipped / 5.0 * 255).astype(np.uint8)
+                    depth_img = PILImage.fromarray(depth_vis_uint8, mode='L')
+                    depth_path = os.path.join(output_dir, f"debug_depth_raw_{timestamp}.png")
+                    depth_img.save(depth_path)
+                    print(f"  [DEBUG] Saved raw depth image to: {depth_path}")
+                    
+                    # Save normalized depth
+                    depth_norm_vis = first_depth.cpu().numpy()
+                    # Normalized depth is roughly in [-2, 2] range, map to 0-255
+                    depth_norm_clipped = np.clip((depth_norm_vis + 2.0) / 4.0, 0, 1)
+                    depth_norm_uint8 = (depth_norm_clipped * 255).astype(np.uint8)
+                    depth_norm_img = PILImage.fromarray(depth_norm_uint8, mode='L')
+                    depth_norm_path = os.path.join(output_dir, f"debug_depth_normalized_{timestamp}.png")
+                    depth_norm_img.save(depth_norm_path)
+                    print(f"  [DEBUG] Saved normalized depth image to: {depth_norm_path}")
+                    
+                    # Save RGB image
+                    rgb_vis = first_rgb.cpu().numpy()  # (3, H, W)
+                    # RGB is normalized with ImageNet stats, denormalize: x * std + mean
+                    # ImageNet: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    # But Eagle uses mean=0.5, std=0.5
+                    rgb_denorm = rgb_vis * 0.5 + 0.5  # Assuming Eagle normalization
+                    rgb_denorm = np.clip(rgb_denorm, 0, 1)
+                    rgb_uint8 = (rgb_denorm * 255).astype(np.uint8)
+                    rgb_uint8 = np.transpose(rgb_uint8, (1, 2, 0))  # (H, W, 3)
+                    rgb_img = PILImage.fromarray(rgb_uint8, mode='RGB')
+                    rgb_path = os.path.join(output_dir, f"debug_rgb_{timestamp}.png")
+                    rgb_img.save(rgb_path)
+                    print(f"  [DEBUG] Saved RGB image to: {rgb_path}")
+                    
+                except Exception as e:
+                    print(f"  [DEBUG] Failed to save debug images: {e}")
+                
+                # Log Eagle processor config for train vs eval comparison
+                print(f"\n[GROOT EAGLE PROCESSOR CONFIG]")
+                print(f"  Processor type: {type(self.proc).__name__}")
+                if hasattr(self.proc, 'image_processor'):
+                    img_proc = self.proc.image_processor
+                    print(f"  Image processor type: {type(img_proc).__name__}")
+                    # Print all config attributes
+                    for attr in ['do_convert_rgb', 'do_normalize', 'do_rescale', 'do_resize', 
+                                 'image_mean', 'image_std', 'rescale_factor', 'size',
+                                 'data_format', 'tokens_per_tile', 'use_thumbnail',
+                                 'min_dynamic_tiles', 'max_dynamic_tiles']:
+                        if hasattr(img_proc, attr):
+                            print(f"    {attr}: {getattr(img_proc, attr)}")
+                if hasattr(self.proc, 'tokenizer'):
+                    tok = self.proc.tokenizer
+                    print(f"  Tokenizer type: {type(tok).__name__}")
+                    print(f"    padding_side: {getattr(tok, 'padding_side', 'N/A')}")
+                print("")
             
             # Clean up depth_raw
             obs.pop("depth_raw", None)

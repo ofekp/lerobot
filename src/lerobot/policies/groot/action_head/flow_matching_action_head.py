@@ -225,6 +225,11 @@ class FlowmatchingActionHead(nn.Module):
             self.model.requires_grad_(False)
         print(f"Tune action head projector: {self.tune_projector}")
         print(f"Tune action head diffusion model: {self.tune_diffusion_model}")
+        # Print requires_grad status for state/action encoder/decoder
+        print(f"  state_encoder.requires_grad: {any(p.requires_grad for p in self.state_encoder.parameters())}")
+        print(f"  action_encoder.requires_grad: {any(p.requires_grad for p in self.action_encoder.parameters())}")
+        print(f"  action_decoder.requires_grad: {any(p.requires_grad for p in self.action_decoder.parameters())}")
+        print(f"  DiT model.requires_grad: {any(p.requires_grad for p in self.model.parameters())}")
         # Check if any parameters are still trainable. If not, print a warning.
         if not tune_projector and not tune_diffusion_model:
             for name, p in self.named_parameters():

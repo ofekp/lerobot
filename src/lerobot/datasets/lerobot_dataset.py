@@ -1047,7 +1047,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
-
+        
         if self.image_transforms is not None:
             # Apply transforms only to RGB images (image/video), not depth
             rgb_keys = self.meta.image_keys + self.meta.video_keys

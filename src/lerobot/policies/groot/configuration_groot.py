@@ -200,10 +200,17 @@ class GrootConfig(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
-        """Return scheduler configuration."""
+        """Return scheduler configuration.
+        
+        Note: This uses self.max_steps for decay calculation. If you want different
+        scheduler settings, either:
+        1. Set use_policy_training_preset=false and provide --scheduler.* CLI args
+        2. Or modify max_steps in the policy config
+        """
+        num_steps = self.max_steps  # Use configurable max_steps instead of hardcoded 10000
         return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=int(10000 * self.warmup_ratio),  # 5% warmup by default
-            num_decay_steps=10000,  # Adjust based on training steps
+            num_warmup_steps=int(num_steps * self.warmup_ratio),  # 5% warmup by default
+            num_decay_steps=num_steps,
             peak_lr=self.optimizer_lr,
             decay_lr=self.optimizer_lr * 0.1,
         )

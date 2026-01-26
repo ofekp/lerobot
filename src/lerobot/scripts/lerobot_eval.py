@@ -292,6 +292,7 @@ def eval_policy(
 
     start = time.time()
     policy.eval()
+    print("Policy is now in eval mode (policy.eval() called).")
 
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
     # divisible by env.num_envs we end up discarding some data in the last batch.

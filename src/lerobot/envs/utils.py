@@ -87,7 +87,7 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
             # convert to channel first of type float32 in range [0,1]
             img_tensor = einops.rearrange(img_tensor, "b h w c -> b c h w").contiguous()
             img_tensor = img_tensor.type(torch.float32)
-            img_tensor /= 255
+            img_tensor /= 255  # TODO(ofekp): check why this is needed if we're doing normalization in the pipeline later
 
             return_observations[imgkey] = img_tensor
 

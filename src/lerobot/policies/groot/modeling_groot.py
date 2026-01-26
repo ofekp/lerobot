@@ -72,8 +72,20 @@ class GrootPolicy(PreTrainedPolicy):
         # Handle Flash Attention compatibility issues
         self._handle_flash_attention_compatibility()
 
+        pretrained_model_name_or_path = self.config.base_model_path
+        if self.config.pretrained_path is not None and os.path.exists(self.config.pretrained_path):
+            pretrained_model_name_or_path = self.config.pretrained_path
+
+        # Debug: Print config values to verify CLI args are being respected
+        print(f"[GROOT DEBUG] _create_groot_model config values:")
+        print(f"  tune_llm={self.config.tune_llm}")
+        print(f"  tune_visual={self.config.tune_visual}")
+        print(f"  tune_projector={self.config.tune_projector}")
+        print(f"  tune_diffusion_model={self.config.tune_diffusion_model}")
+        print(f"  use_depth={self.config.use_depth}")
+
         model = GR00TN15.from_pretrained(
-            pretrained_model_name_or_path=self.config.base_model_path,
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
             tune_llm=self.config.tune_llm,
             tune_visual=self.config.tune_visual,
             tune_projector=self.config.tune_projector,

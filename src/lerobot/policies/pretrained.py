@@ -144,6 +144,26 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # Load the model with appropriate kwargs
         missing_keys, unexpected_keys = load_model_as_safetensor(model, model_file, **kwargs)
         log_model_loading_keys(missing_keys, unexpected_keys)
+        
+        # Debug: Print patch embedding weights after loading (Stage 3)
+        # This helps verify weights were loaded correctly from checkpoint
+        if hasattr(model, '_groot_model') and hasattr(model._groot_model, 'backbone'):
+            try:
+                patch_embed = model._groot_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
+                weights = patch_embed.weight.data
+                print(f"\n[GROOT PATCH EMBED DEBUG] Stage 3: After load_model_as_safetensor")
+                print(f"  Shape: {weights.shape}")
+                flat = weights[:, :, :, :].reshape(weights.shape[0], weights.shape[1], -1)
+                for ch, name in enumerate(['R', 'G', 'B']):
+                    if ch < weights.shape[1]:
+                        vals = flat[0, ch, :5].tolist()
+                        print(f"  Channel {name}: {[f'{v:.6f}' for v in vals]}")
+                if weights.shape[1] >= 4:
+                    vals = flat[0, 3, :5].tolist()
+                    print(f"  Channel D: {[f'{v:.6f}' for v in vals]}")
+                print("")
+            except Exception as e:
+                print(f"[GROOT] Could not print Stage 3 weights: {e}")
 
         # For older versions, manually move to device if needed
         if "device" not in kwargs and map_location != "cpu":
