@@ -65,6 +65,7 @@ import einops
 import gymnasium as gym
 import numpy as np
 import torch
+from PIL import Image
 from termcolor import colored
 from torch import Tensor, nn
 from tqdm import trange
@@ -260,6 +261,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    save_first_frames_dir: Path | None = None,
 ) -> dict:
     """
     Args:
@@ -272,6 +274,8 @@ def eval_policy(
             the "episodes" key of the returned dictionary.
         start_seed: The first seed to use for the first individual rollout. For all subsequent rollouts the
             seed is incremented by 1. If not provided, the environments are not manually seeded.
+        save_first_frames_dir: If provided, saves the first frame (initial scene) of each episode to this
+            directory. Useful for comparing object placements across episodes to verify randomization.
     Returns:
         Dictionary with metrics and data regarding the rollouts.
     """
@@ -305,6 +309,13 @@ def eval_policy(
     all_seeds = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
+    n_first_frames_saved = 0  # for saving first frames
+
+    # Setup first frames directory if requested
+    if save_first_frames_dir is not None:
+        save_first_frames_dir = Path(save_first_frames_dir)
+        save_first_frames_dir.mkdir(parents=True, exist_ok=True)
+        first_frame_paths: list[str] = []
 
     # Callback for visualization.
     def render_frame(env: gym.vector.VectorEnv):
@@ -338,6 +349,35 @@ def eval_policy(
             seeds = range(
                 start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs)
             )
+
+        # Save first frames of each episode if requested (before rollout to capture initial state)
+        if save_first_frames_dir is not None:
+            # Reset env to capture first frame, then reset again for actual rollout
+            # We do a quick render to capture the initial scene
+            _obs, _info = env.reset(seed=list(seeds) if seeds else None)
+            if isinstance(env, gym.vector.SyncVectorEnv):
+                first_frames = [env.envs[i].render() for i in range(env.num_envs)]
+            elif isinstance(env, gym.vector.AsyncVectorEnv):
+                first_frames = env.call("render")
+            else:
+                first_frames = [env.render()]
+            
+            for i, frame in enumerate(first_frames):
+                if n_first_frames_saved >= n_episodes:
+                    break
+                seed_str = f"_seed{list(seeds)[i]}" if seeds else ""
+                frame_path = save_first_frames_dir / f"episode_{n_first_frames_saved:03d}{seed_str}_first_frame.png"
+                
+                if isinstance(frame, np.ndarray):
+                    if frame.dtype in [np.float32, np.float64]:
+                        frame = (frame * 255).clip(0, 255).astype(np.uint8)
+                    img = Image.fromarray(frame)
+                else:
+                    img = frame
+                img.save(frame_path)
+                first_frame_paths.append(str(frame_path))
+                n_first_frames_saved += 1
+
         rollout_data = rollout(
             env=env,
             policy=policy,
@@ -455,6 +495,10 @@ def eval_policy(
 
     if max_episodes_rendered > 0:
         info["video_paths"] = video_paths
+
+    if save_first_frames_dir is not None:
+        info["first_frame_paths"] = first_frame_paths
+        logging.info(f"Saved {len(first_frame_paths)} first frames to {save_first_frames_dir}")
 
     return info
 
@@ -605,6 +649,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    save_first_frames_dir: Path | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -622,6 +667,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        save_first_frames_dir=save_first_frames_dir,
     )
 
     per_episode = task_result["per_episode"]
@@ -672,6 +718,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        save_first_frames_dir=Path("output/first_frames"),
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:

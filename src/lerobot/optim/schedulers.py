@@ -96,8 +96,6 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
         actual_warmup_steps = self.num_warmup_steps
         actual_decay_steps = self.num_decay_steps
 
-        import pdb; pdb.set_trace()
-
         if num_training_steps < self.num_decay_steps:
             # Calculate scaling factor to fit the schedule into the available training steps
             scale_factor = num_training_steps / self.num_decay_steps
