@@ -228,10 +228,15 @@ class LiberoEnv(gym.Env):
         self.task_description = task.language
         task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
 
+        # Extract base camera names (without _image suffix) for robosuite
+        # e.g., "frontview_image" -> "frontview"
+        camera_names_for_env = [cam.replace("_image", "") for cam in self.camera_name]
+
         env_args = {
             "bddl_file_name": task_bddl_file,
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
+            "camera_names": camera_names_for_env,
         }
         env = OffScreenRenderEnv(**env_args)
         env.reset()
@@ -241,6 +246,7 @@ class LiberoEnv(gym.Env):
         images = {}
         for camera_name in self.camera_name:
             image = raw_obs[camera_name]
+            # image = image[::-1, ::-1]
             images[self.camera_name_mapping[camera_name]] = image
 
         eef_pos = raw_obs.get("robot0_eef_pos")
@@ -393,6 +399,7 @@ def create_libero_envs(
     env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None = None,
     control_mode: str = "relative",
     episode_length: int | None = None,
+    camera_name_mapping: dict[str, str] | None = None,
 ) -> dict[str, dict[int, Any]]:
     """
     Create vectorized LIBERO environments with a consistent return shape.
@@ -411,6 +418,9 @@ def create_libero_envs(
 
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
+
+    if camera_name_mapping is not None:
+        gym_kwargs["camera_name_mapping"] = camera_name_mapping
 
     camera_names = _parse_camera_names(camera_name)
     suite_names = [s.strip() for s in str(task).split(",") if s.strip()]

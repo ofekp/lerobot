@@ -70,6 +70,7 @@ def make_env_pre_post_processors(
         return make_xvla_libero_pre_post_processors()
 
     # For LIBERO environments, add the LiberoProcessorStep to preprocessor
+    import pdb; pdb.set_trace()
     if isinstance(env_cfg, LiberoEnv) or "libero" in env_cfg.type:
         preprocessor_steps.append(LiberoProcessorStep())
 
@@ -180,6 +181,7 @@ def make_env(
             env_cls=env_cls,
             control_mode=cfg.control_mode,
             episode_length=cfg.episode_length,
+            camera_name_mapping=cfg.camera_name_mapping,
         )
     elif "metaworld" in cfg.type:
         from lerobot.envs.metaworld import create_metaworld_envs

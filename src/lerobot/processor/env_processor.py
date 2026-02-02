@@ -52,13 +52,12 @@ class LiberoProcessorStep(ObservationProcessorStep):
         """
         processed_obs = observation.copy()
         for key in list(processed_obs.keys()):
-            if key.startswith(f"{OBS_IMAGES}."):
-                img = processed_obs[key]
-
-                # Flip both H and W
-                img = torch.flip(img, dims=[2, 3])
-
-                processed_obs[key] = img
+            if False:
+                if key.startswith(f"{OBS_IMAGES}."):
+                    img = processed_obs[key]
+                    # Flip both H and W
+                    img = torch.flip(img, dims=[2, 3])
+                    processed_obs[key] = img
         # Process robot_state into a flat state vector
         if "observation.robot_state" in processed_obs:
             robot_state = processed_obs.pop("observation.robot_state")
