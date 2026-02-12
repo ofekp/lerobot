@@ -108,6 +108,8 @@ def get_task_init_states(task_suite: Any, i: int) -> np.ndarray:
         / task_suite.tasks[i].problem_folder
         / task_suite.tasks[i].init_states_file
     )
+    # e.g.
+    # init_states_path = /usr/local/lib/python3.10/dist-packages/libero/libero/init_files/libero_goal/open_the_top_drawer_and_put_the_bowl_inside.pruned_init
     init_states = torch.load(init_states_path, weights_only=False)  # nosec B614
     return init_states
 
@@ -274,7 +276,8 @@ class LiberoEnv(gym.Env):
     def render(self):
         raw_obs = self._env.env._get_observations()
         formatted_obs = self._format_raw_obs(raw_obs)
-        image = formatted_obs["pixels"]["image"]
+        # image = formatted_obs["pixels"]["image"]
+        image = formatted_obs["pixels"][self.camera_name_mapping[self.camera_name[0]]]
         image = image[::-1, ::-1]  # flip both H and W for visualization
         assert image.shape[2] == 3
         

@@ -269,6 +269,7 @@ class GrootPackInputsStep(ProcessorStep):
     # Min-max normalization (SO100-like) applied BEFORE padding
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    _logged_task: bool = field(default=False, init=False, repr=False)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
@@ -327,7 +328,7 @@ class GrootPackInputsStep(ProcessorStep):
                         depth_keys.append("observation.image.depth")
                         found_depth = True
                         break
-                    depth_key = [f"{img_key}.depth" for img_key in img_key]
+                    depth_key = f"{img_key}.depth"
                     if depth_key in obs:
                         found_depth = True
                         depth_keys.append(depth_key)
@@ -371,6 +372,9 @@ class GrootPackInputsStep(ProcessorStep):
         if self.formalize_language:
             lang = (lang or "").lower()
             lang = "".join(ch for ch in lang if ch.isalnum() or ch.isspace())
+        if not self._logged_task:
+            print(f"[GROOT GrootPackInputsStep] Task description: '{lang}'")
+            self._logged_task = True
         comp["language"] = lang
 
         # 3) State/state_mask -> (B, 1, max_state_dim)
@@ -672,6 +676,7 @@ class GrootEagleCollateStep(ProcessorStep):
     depth_std: float = 0.5   # Scale to roughly match RGB normalized range
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
     _logged_first_depth: bool = field(default=False, init=False, repr=False)
+    _logged_first_rgb: bool = field(default=False, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
@@ -697,10 +702,11 @@ class GrootEagleCollateStep(ProcessorStep):
         
         # Late fusion: concatenate depth with RGB pixel_values if depth_raw exists
         depth_raw = obs.get("depth_raw")
+        # depth_raw: (B, 1, V, 1, H, W) - raw depth values
+        # eagle_pixel_values: (N, 3, H', W') where N = B * T * V, normalized RGB
+        assert "eagle_pixel_values" in comp, "[GROOT] eagle_pixel_values not found in complementary data after collate."
+        pixel_values = comp["eagle_pixel_values"]  # (N, 3, H', W')
         if depth_raw is not None and "eagle_pixel_values" in comp:
-            # depth_raw: (B, 1, V, 1, H, W) - raw depth values
-            # eagle_pixel_values: (N, 3, H', W') where N = B * T * V, normalized RGB
-            pixel_values = comp["eagle_pixel_values"]  # (N, 3, H', W')
             n, c, h_pv, w_pv = pixel_values.shape  # [3, 3, 224, 224]
             
             # Reshape depth to match pixel_values layout
@@ -730,7 +736,6 @@ class GrootEagleCollateStep(ProcessorStep):
             # depth_flat == depth_normalized and are in meters
 
             # Concatenate depth as 4th channel: (N, 4, H', W')
-            # TODO(ofekp): verify that cam-depth alignment is correct
             pixel_values_rgbd = torch.cat([pixel_values, depth_normalized], dim=1)
             comp["eagle_pixel_values"] = pixel_values_rgbd
             
@@ -754,8 +759,9 @@ class GrootEagleCollateStep(ProcessorStep):
                 print(f"  Corner samples: TL={first_depth_raw[0,0].item():.6f}, TR={first_depth_raw[0,-1].item():.6f}, BL={first_depth_raw[-1,0].item():.6f}, BR={first_depth_raw[-1,-1].item():.6f}")
                 if unique_rows < 10:
                     print(f"  WARNING: Only {unique_rows} unique rows - depth image may be corrupted!")
-                
+
                 print(first_depth)
+
                 print(f"[GROOT DEPTH DEBUG] First frame depth stats (normalized, before network):")
                 print(f"  Shape: {first_depth.shape}")
                 print(f"  Min: {first_depth.min().item():.6f}, Max: {first_depth.max().item():.6f}")
@@ -837,6 +843,11 @@ class GrootEagleCollateStep(ProcessorStep):
             
             # Clean up depth_raw
             obs.pop("depth_raw", None)
+
+        if not self._logged_first_rgb:
+            self._logged_first_rgb = True
+            print(f"rgb value at     (0, 0): {pixel_values[0][:, 0, 0]}")  # Print RGB values at (0,0)
+            print(f"rgb value at (223, 223): {pixel_values[0][:, -1, -1]}")  # Print RGB values at (224,224)
         
         obs.pop(
             "video", None

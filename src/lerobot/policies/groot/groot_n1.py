@@ -78,6 +78,9 @@ class EagleBackbone(nn.Module):
                 - "rgb_average": Initialize as average of RGB channels (recommended)
                 - "zero": Initialize to zero
                 - "random": Random initialization (default PyTorch init)
+
+        config - https://huggingface.co/lerobot/eagle2hg-processor-groot-n1p5/blob/main/config.json
+        from_pretrained - https://github.com/huggingface/transformers/blob/v5.0.0rc2/src/transformers/modeling_utils.py#L3656
         """
         print(f"[GROOT] Initializing EagleBackbone with use_depth={use_depth}, _skip_depth_init={_skip_depth_init}")
         super().__init__()
