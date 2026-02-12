@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_STR
+from lerobot.utils.constants import OBS_IMAGES, OBS_IMAGE, OBS_STATE, OBS_STR
 
 from .pipeline import ObservationProcessorStep, ProcessorStepRegistry
 
@@ -52,13 +52,15 @@ class LiberoProcessorStep(ObservationProcessorStep):
         """
         processed_obs = observation.copy()
         for key in list(processed_obs.keys()):
-            if key.startswith(f"{OBS_IMAGES}."):
-                img = processed_obs[key]
-
-                # Flip both H and W
-                img = torch.flip(img, dims=[2, 3])
-
-                processed_obs[key] = img
+            # TODO(ofekp): this was critical to the success of the training, why was this done in the first place?
+            #              even if this is needed, this only applied to observation.images prefix, and not observation.image
+            if False:
+                if key.startswith(f"{OBS_IMAGES}.") or key.startswith(f"{OBS_IMAGE}"):
+                    print("Inside libero processor flipping image!")
+                    img = processed_obs[key]
+                    # Flip both H and W
+                    img = torch.flip(img, dims=[2, 3])
+                    processed_obs[key] = img
         # Process robot_state into a flat state vector
         if "observation.robot_state" in processed_obs:
             robot_state = processed_obs.pop("observation.robot_state")
