@@ -51,16 +51,24 @@ class GrootConfig(PreTrainedConfig):
     # Image preprocessing (adjust to match Groot's expected input)
     image_size: tuple[int, int] = (224, 224)
 
-    # Depth modality augmentation (following the paper: "Modality-Augmented Fine-Tuning 
-    # of Foundation Robot Policies for Cross-Embodiment Manipulation")
-    # When enabled, depth images are concatenated with RGB to form RGB-D (4-channel) input
+    # Depth branch (Fourier encoding + CNN + zero-init gate)
+    # When enabled, a separate depth processing branch produces embeddings that are
+    # added element-wise to RGB patch embeddings. The RGB patch embedding is NOT modified.
     use_depth: bool = False
 
-    # Method to initialize the depth channel weights in the vision encoder
-    # "rgb_average": Initialize as average of RGB channels (recommended from paper)
-    # "zero": Initialize to zero
-    # "random": Random initialization
-    depth_weight_init: str = "rgb_average"
+    # Fourier positional encoding dimension for depth pixels
+    depth_fourier_dim: int = 64
+
+    # Hidden channels in the depth CNN branch
+    depth_hidden_dim: int = 256
+
+    # Fourier frequency range (higher max captures finer depth detail)
+    # For 0-3m depth, max_freq=50 gives ~2cm wavelength — fine detail without noise
+    depth_min_freq: float = 1.0
+    depth_max_freq: float = 50.0
+
+    # Whether Fourier frequencies are learnable parameters
+    depth_learnable_freqs: bool = False
 
     # Depth normalization parameters for late fusion (after Eagle RGB processing)
     # Raw depth values are transformed as: (depth * depth_scale - depth_mean) / depth_std

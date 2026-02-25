@@ -46,6 +46,7 @@ from lerobot.policies.groot.action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
 )
+from lerobot.policies.groot.depth_encoder import DepthBranchEncoder
 from lerobot.policies.groot.utils import ensure_eagle_cache_ready
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
@@ -66,29 +67,31 @@ class EagleBackbone(nn.Module):
         tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO,
         project_to_dim: int = 1536,
         use_depth: bool = False,
-        depth_weight_init: str = "rgb_average",
-        _skip_depth_init: bool = False,
+        depth_fourier_dim: int = 64,
+        depth_hidden_dim: int = 256,
+        depth_min_freq: float = 1.0,
+        depth_max_freq: float = 50.0,
+        depth_learnable_freqs: bool = False,
     ):
         """
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
-            use_depth: whether to use RGB-D (4-channel) input instead of RGB (3-channel)
-            depth_weight_init: method to initialize depth channel weights
-                - "rgb_average": Initialize as average of RGB channels (recommended)
-                - "zero": Initialize to zero
-                - "random": Random initialization (default PyTorch init)
+            use_depth: whether to use a separate depth branch (Fourier + CNN + zero-init gate)
+            depth_fourier_dim: Fourier positional encoding dimension for depth (default 64).
+            depth_hidden_dim: Hidden channels in the depth CNN branch (default 256).
+            depth_min_freq: Minimum Fourier frequency (default 1.0).
+            depth_max_freq: Maximum Fourier frequency (default 50.0).
+            depth_learnable_freqs: Whether Fourier frequencies are learnable (default False).
 
         config - https://huggingface.co/lerobot/eagle2hg-processor-groot-n1p5/blob/main/config.json
         from_pretrained - https://github.com/huggingface/transformers/blob/v5.0.0rc2/src/transformers/modeling_utils.py#L3656
         """
-        print(f"[GROOT] Initializing EagleBackbone with use_depth={use_depth}, _skip_depth_init={_skip_depth_init}")
+        print(f"[GROOT] Initializing EagleBackbone with use_depth={use_depth}")
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
 
         self.use_depth = use_depth
-        self.depth_weight_init = depth_weight_init
-        self._depth_extended = False
 
         # Prefer loading Eagle model config from the cache directory where vendor files were copied.
         vendor_dir = DEFAULT_VENDOR_EAGLE_PATH
@@ -100,19 +103,43 @@ class EagleBackbone(nn.Module):
 
         config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
-
-        # Depth extension strategy:
-        # - Eval (loading 4-channel checkpoint): extend now so shapes match when loading weights
-        # - Training (loading 3-channel HF checkpoint): defer extension until after weights are loaded,
-        #   so we can initialize depth channel as rgb_average of pretrained RGB weights
-        if self.use_depth and not _skip_depth_init:
-            self._extend_patch_embedding_for_depth()
-            self._depth_extended = True
-
+        
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
         else:
             self.eagle_linear = torch.nn.Identity()
+
+        # Backbone output dim (after eagle_linear projection or Identity)
+        self._backbone_output_dim = project_to_dim if project_to_dim is not None else 2048
+
+        # --- Depth branch: separate encoder → project → concatenate with eagle tokens ---
+        # Depth tokens are produced independently and concatenated along the sequence
+        # dimension with Eagle VL tokens, giving the action head access to both
+        # RGB/language features and depth features through cross-attention.
+        self.depth_branch = None
+        self.depth_proj = None
+        if self.use_depth:
+            vision_cfg = config.vision_config
+            embed_dim = vision_cfg.hidden_size  # 1152
+            assert embed_dim == 1152, f"Expected embed_dim of 1152 from the Eagle vision config, got {embed_dim}"
+            patch_size = vision_cfg.patch_size  # 14
+            assert patch_size == 14, f"Expected patch_size of 14 from the Eagle vision config, got {patch_size}"
+
+            self.depth_branch = DepthBranchEncoder(
+                fourier_dim=depth_fourier_dim,
+                embed_dim=embed_dim,
+                patch_size=patch_size,
+                hidden_dim=depth_hidden_dim,
+                min_freq=depth_min_freq,
+                max_freq=depth_max_freq,
+                learnable_freqs=depth_learnable_freqs,
+            )
+            # Project depth tokens from vision embed_dim to backbone output dim
+            self.depth_proj = nn.Linear(embed_dim, self._backbone_output_dim)
+            print(f"[GROOT] Depth branch created: fourier_dim={depth_fourier_dim}, "
+                  f"hidden_dim={depth_hidden_dim}, embed_dim={embed_dim} → {self._backbone_output_dim}, "
+                  f"patch_size={patch_size}")
+            print(f"[GROOT] Depth tokens will be concatenated with Eagle tokens for cross-attention")
 
         # needed since we don't use these layers. Also saves compute
         while len(self.eagle_model.language_model.model.layers) > select_layer:
@@ -120,199 +147,42 @@ class EagleBackbone(nn.Module):
 
         self.select_layer = select_layer
         self.set_trainable_parameters(tune_llm, tune_visual)
-        
+
         # For depth gradient monitoring
         self._depth_grad_step_counter = 0
-        self._depth_grad_hook_handle = None
 
     def register_depth_gradient_hook(self, log_every_n_steps: int = 5000):
-        """Register a hook to monitor depth channel gradients during training.
-        Args:
-            log_every_n_steps: Print gradient stats every N backward passes.
-        """
-        if not self.use_depth or not self._depth_extended:
-            print("[GROOT] Cannot register depth gradient hook: depth not enabled or not extended yet.")
+        """Register a hook to monitor depth branch gradients during training."""
+        if not self.use_depth or self.depth_branch is None:
+            print("[GROOT] Cannot register depth gradient hook: depth branch not available.")
             return
-        patch_embed = self.eagle_model.vision_model.vision_model.embeddings.patch_embedding
+
+        # Monitor the zero-init gate weights (most informative for learning progress)
+        gate = self.depth_branch.patch_embedding.gate
+
         def hook(grad):
             if self._depth_grad_step_counter % log_every_n_steps == 0:
-                depth_grad = grad[:, 3:4, :, :]
-                rgb_grad = grad[:, :3, :, :]
-                # Also print current weight and bias values to track updates
-                depth_weight = patch_embed.weight[:, 3:4, :, :]
-                rgb_weight = patch_embed.weight[:, :3, :, :]
-                bias_str = ""
-                if patch_embed.bias is not None:
-                    bias_str = f", bias norm: {patch_embed.bias.norm().item():.6f}, bias mean: {patch_embed.bias.mean().item():.6f}"
-                print(f"[Depth Grad Monitor @ step {self._depth_grad_step_counter}] "
-                      f"Depth grad norm: {depth_grad.norm().item():.6f}, "
-                      f"RGB grad norm: {rgb_grad.norm().item():.6f}, "
-                      f"Depth weight norm: {depth_weight.norm().item():.6f}, "
-                      f"RGB weight norm: {rgb_weight.norm().item():.6f}"
-                      f"{bias_str}",
-                      flush=True)
+                # Gate weight gradient and value
+                gate_weight_norm = gate.weight.data.norm().item()
+                gate_grad_norm = grad.norm().item()
+                # CNN weights (first layer)
+                cnn_first = self.depth_branch.patch_embedding.cnn[0]
+                cnn_weight_norm = cnn_first.weight.data.norm().item()
+                # Fourier freqs
+                freq_vals = self.depth_branch.fourier_encoding.freqs
+                print(
+                    f"[Depth Branch Monitor @ step {self._depth_grad_step_counter}] "
+                    f"Gate weight norm: {gate_weight_norm:.6f}, "
+                    f"Gate grad norm: {gate_grad_norm:.6f}, "
+                    f"CNN[0] weight norm: {cnn_weight_norm:.6f}, "
+                    f"Fourier freq range: [{freq_vals.min().item():.2f}, {freq_vals.max().item():.2f}]",
+                    flush=True,
+                )
             self._depth_grad_step_counter += 1
             return grad
-        self._depth_grad_hook_handle = patch_embed.weight.register_hook(hook)
-        print(f"[GROOT] Depth gradient hook registered (logging every {log_every_n_steps} steps)")
 
-    def extend_patch_embedding_for_depth(self):
-        """Public method to extend patch embedding for depth after pretrained weights are loaded.
-        
-        This should be called after from_pretrained() loads the 3-channel weights.
-        If the loaded weights already have 4 channels (i.e., checkpoint was trained with depth),
-        this method will skip the extension to preserve the trained depth weights.
-        """
-        if self._depth_extended:
-            print("[GROOT] Patch embedding already extended for depth, skipping.")
-            return
-        if not self.use_depth:
-            print("[GROOT] use_depth is False, skipping depth extension.")
-            return
-        
-        # Check if patch embedding already has 4 channels (loaded from depth-trained checkpoint)
-        vision_model = self.eagle_model.vision_model
-        patch_embed = vision_model.vision_model.embeddings.patch_embedding
-        
-        if isinstance(patch_embed, nn.Conv2d):
-            current_in_channels = patch_embed.weight.shape[1]
-        elif isinstance(patch_embed, nn.Linear):
-            # For linear, assume patch_size can be inferred
-            in_features = patch_embed.weight.shape[1]
-            # Try 4 channels first
-            patch_area_4ch = in_features // 4
-            patch_size_4ch = int(patch_area_4ch ** 0.5)
-            if patch_size_4ch * patch_size_4ch * 4 == in_features:
-                current_in_channels = 4
-            else:
-                current_in_channels = 3  # Assume 3 if not 4
-        else:
-            current_in_channels = 3  # Default assumption
-        
-        if current_in_channels == 4:
-            print("[GROOT] Patch embedding already has 4 channels (loaded from depth-trained checkpoint), skipping extension.")
-            self._depth_extended = True
-            return
-        
-        self._extend_patch_embedding_for_depth()
-        self._depth_extended = True
-
-    def _extend_patch_embedding_for_depth(self):
-        """Extend the vision model's patch embedding from 3 to 4 channels.
-        
-        Following the paper "Modality-Augmented Fine-Tuning of Foundation Robot Policies":
-        - Expand the patch embedding from 3 to 4 channels for RGB-D fusion
-        - Initialize depth-channel weights using RGB kernel averaging:
-          W_patch(D) = 1/3 * (W_patch(R) + W_patch(G) + W_patch(B))
-        """
-        vision_model = self.eagle_model.vision_model
-        
-        # Find the patch embedding layer - it's typically in the embeddings
-        # patch_embed = None
-        # patch_embed_attr = None
-        
-        # Try common paths for patch embedding in various ViT architectures
-        # possible_paths = [   
-        #     ('embeddings', 'patch_embedding'),
-        #     ('embeddings', 'patch_embeddings', 'projection'),
-        #     ('patch_embed', 'proj'),
-        #     ('patch_embedding',),
-        # ]
-        
-        patch_embed_attr = ["vision_model", "embeddings", "patch_embedding"]
-        obj = vision_model
-        for attr in patch_embed_attr:
-            obj = getattr(obj, attr)
-        patch_embed = obj
-
-        if not (isinstance(obj, nn.Conv2d) or isinstance(obj, nn.Linear)):
-            raise ValueError(f"Unexpected patch embedding type: {type(obj)}")
-        
-        print(f"[GROOT] Original patch embedding shape: {patch_embed.weight.shape}")
-        
-        if isinstance(patch_embed, nn.Conv2d):
-            # Conv2d patch embedding: weight shape is (out_channels, in_channels, H, W)
-            old_weight = patch_embed.weight.data  # (out, 3, H, W)
-            out_channels, in_channels, kh, kw = old_weight.shape
-            
-            if in_channels != 3:
-                print(f"[GROOT] Warning: Expected 3 input channels, got {in_channels}. Skipping depth extension.")
-                return
-            
-            # Create new Conv2d with 4 input channels
-            new_conv = nn.Conv2d(
-                in_channels=4,
-                out_channels=out_channels,
-                kernel_size=(kh, kw),
-                stride=patch_embed.stride,
-                padding=patch_embed.padding,
-                bias=patch_embed.bias is not None,
-            )
-            
-            # Initialize: copy RGB weights, init depth channel
-            with torch.no_grad():
-                new_conv.weight[:, :3, :, :] = old_weight
-                if self.depth_weight_init == "rgb_average":
-                    # Average of RGB channels as recommended in paper
-                    depth_init = old_weight.mean(dim=1, keepdim=True)
-                    new_conv.weight[:, 3:4, :, :] = depth_init
-                elif self.depth_weight_init == "zero":
-                    new_conv.weight[:, 3:4, :, :] = 0.0
-                # "random" uses default PyTorch initialization (already done)
-                if patch_embed.bias is not None:
-                    new_conv.bias.copy_(patch_embed.bias)
-            
-            # Replace the old conv with the new one
-            self._replace_module(vision_model, patch_embed_attr, new_conv)
-            print(f"[GROOT] Extended patch embedding to 4 channels (RGB-D)")
-            print(f"[GROOT] New patch embedding shape: {new_conv.weight.shape}")
-            
-        elif isinstance(patch_embed, nn.Linear):
-            # Linear patch embedding: weight shape is (out_features, in_features)
-            # in_features = patch_size * patch_size * 3
-            old_weight = patch_embed.weight.data
-            out_features, in_features = old_weight.shape
-            
-            # Assume patch_size is square root of in_features / 3
-            patch_area = in_features // 3
-            patch_size = int(patch_area ** 0.5)
-            
-            if patch_size * patch_size * 3 != in_features:
-                print(f"[GROOT] Warning: Cannot determine patch size from in_features={in_features}. Skipping.")
-                return
-            
-            # Create new Linear with 4 channels
-            new_in_features = patch_size * patch_size * 4
-            new_linear = nn.Linear(new_in_features, out_features, bias=patch_embed.bias is not None)
-            
-            with torch.no_grad():
-                # Reshape old weights to (out, patch_size, patch_size, 3) for manipulation
-                old_reshaped = old_weight.view(out_features, patch_size, patch_size, 3)
-                
-                if self.depth_weight_init == "rgb_average":
-                    depth_init = old_reshaped.mean(dim=-1, keepdim=True)
-                elif self.depth_weight_init == "zero":
-                    depth_init = torch.zeros(out_features, patch_size, patch_size, 1, device=old_weight.device)
-                else:  # random
-                    depth_init = torch.randn(out_features, patch_size, patch_size, 1, device=old_weight.device) * 0.02
-                
-                # Concatenate RGB + D
-                new_reshaped = torch.cat([old_reshaped, depth_init], dim=-1)
-                new_linear.weight.copy_(new_reshaped.view(out_features, -1))
-                
-                if patch_embed.bias is not None:
-                    new_linear.bias.copy_(patch_embed.bias)
-            
-            self._replace_module(vision_model, patch_embed_attr, new_linear)
-            print(f"[GROOT] Extended patch embedding to 4 channels (RGB-D)")
-            print(f"[GROOT] New patch embedding shape: {new_linear.weight.shape}")
-
-    def _replace_module(self, parent: nn.Module, path: tuple, new_module: nn.Module):
-        """Replace a nested module given its path."""
-        obj = parent
-        for attr in path[:-1]:
-            obj = getattr(obj, attr)
-        setattr(obj, path[-1], new_module)
+        gate.weight.register_hook(hook)
+        print(f"[GROOT] Depth branch gradient hook registered (logging every {log_every_n_steps} steps)")
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
         self.tune_llm = tune_llm
@@ -324,19 +194,17 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
-        if self.use_depth:
-            # Enable gradients for the patch embedding but use a hook to zero out
-            # RGB gradients, following the paper's approach of only training depth weights
-            patch_embed = self.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-            patch_embed.weight.requires_grad = True
-            if patch_embed.bias is not None:
-                patch_embed.bias.requires_grad = True
-            
-            # Register gradient hook to only train depth channel (channel 3)
-            # This zeros out gradients for RGB channels (0:3), keeping only depth gradients
-            self._register_depth_only_gradient_hook(patch_embed)
-            print(f"[GROOT] Patch embedding: training ONLY depth channel (frozen RGB channels 0:3)")
-            print(f"Tune backbone patch embedding (depth): weight=True, bias={patch_embed.bias is not None}")
+        if self.use_depth and self.depth_branch is not None:
+            # The depth branch + projection are always trainable (randomly initialized)
+            self.depth_branch.requires_grad_(True)
+            if self.depth_proj is not None:
+                self.depth_proj.requires_grad_(True)
+            n_depth_params = sum(p.numel() for p in self.depth_branch.parameters())
+            n_trainable_depth = sum(p.numel() for p in self.depth_branch.parameters() if p.requires_grad)
+            if self.depth_proj is not None:
+                n_depth_params += sum(p.numel() for p in self.depth_proj.parameters())
+                n_trainable_depth += sum(p.numel() for p in self.depth_proj.parameters() if p.requires_grad)
+            print(f"[GROOT] Depth branch + projection: {n_depth_params} params ({n_trainable_depth} trainable)")
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -346,30 +214,6 @@ class EagleBackbone(nn.Module):
                     print(f"Backbone trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No backbone trainable parameters found.")
-    
-    def _register_depth_only_gradient_hook(self, patch_embed: nn.Module):
-        """Register a gradient hook that zeros out RGB channel gradients.
-        
-        Following the paper "Modality-Augmented Fine-Tuning of Foundation Robot Policies":
-        - The vision tower (including RGB patch embedding weights) is frozen
-        - Only the newly added depth channel weights are trained
-        
-        For Conv2d: weight shape is (out_channels, in_channels, H, W)
-            - in_channels 0:3 are RGB (frozen)
-            - in_channels 3:4 is depth (trainable)
-        """
-        def zero_rgb_gradients(grad):
-            # Clone to avoid in-place modification issues
-            new_grad = grad.clone()
-            # Zero out gradients for RGB channels (indices 0, 1, 2)
-            new_grad[:, :3, :, :] = 0.0
-            return new_grad
-        
-        # Store the hook handle so we can remove it if needed
-        if hasattr(self, '_depth_grad_hook'):
-            self._depth_grad_hook.remove()
-        self._depth_grad_hook = patch_embed.weight.register_hook(zero_rgb_gradients)
-        print(f"[GROOT] Registered gradient hook to freeze RGB channels (0:3), train only depth channel (3)")
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -393,11 +237,46 @@ class EagleBackbone(nn.Module):
         }
         del eagle_input["image_sizes"]
 
+        # If depth is enabled, split RGBD pixel_values → RGB for Eagle + depth for branch
+        depth_tokens = None
+        if self.use_depth and self.depth_branch is not None and "pixel_values" in eagle_input:
+            pixel_values = eagle_input["pixel_values"]  # (N, 4, H, W) where N = B*T*V
+            eagle_input["pixel_values"] = pixel_values[:, :3, :, :]  # RGB only for Eagle
+            depth_input = pixel_values[:, 3:4, :, :]  # (N, 1, H, W)
+
+            # Depth branch: Fourier encode → CNN → gate → (N, n_patches, 1152)
+            depth_tokens = self.depth_branch(depth_input)
+            # Project to backbone output dim: (N, n_patches, backbone_dim)
+            depth_tokens = self.depth_proj(depth_tokens)
+
+        # Run Eagle on RGB-only input
         eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
         eagle_features = eagle_output.hidden_states[self.select_layer]
-
         eagle_features = self.eagle_linear(eagle_features)
-        return eagle_features, eagle_input["attention_mask"]
+
+        attn_mask = eagle_input["attention_mask"]
+
+        # Concatenate depth tokens with Eagle VL tokens along sequence dimension
+        if depth_tokens is not None:
+            B = eagle_features.shape[0]
+            N = depth_tokens.shape[0]
+            depth_seq = depth_tokens.shape[1]  # n_patches (e.g. 256 for 224×224)
+            views_per_sample = N // B  # T * V (typically 1)
+
+            depth_tokens = depth_tokens.to(dtype=eagle_features.dtype)
+            depth_tokens = depth_tokens.reshape(B, views_per_sample * depth_seq, -1)
+
+            # backbone_features = concat(eagle_tokens, depth_tokens)
+            eagle_features = torch.cat([eagle_features, depth_tokens], dim=1)
+
+            # Extend attention mask for depth tokens (all ones = attend to all)
+            depth_mask = torch.ones(
+                B, views_per_sample * depth_seq,
+                dtype=attn_mask.dtype, device=attn_mask.device,
+            )
+            attn_mask = torch.cat([attn_mask, depth_mask], dim=1)
+
+        return eagle_features, attn_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
@@ -406,13 +285,22 @@ class EagleBackbone(nn.Module):
 
         # YL (TODO HACK): to resolve DDP issue when tune_visual=True
         # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
-        if self.training and self.tune_visual:
+        if self.training and (self.tune_visual or self.use_depth):
             dummy_term = torch.tensor(
                 0.0, device=eagle_embeds.device, dtype=eagle_embeds.dtype, requires_grad=True
             )
             for param in self.eagle_model.vision_model.parameters():
                 if param.requires_grad:
                     dummy_term = dummy_term + 0.0 * param.sum()
+            # Also include depth branch + projection parameters for DDP compatibility
+            if self.depth_branch is not None:
+                for param in self.depth_branch.parameters():
+                    if param.requires_grad:
+                        dummy_term = dummy_term + 0.0 * param.sum()
+            if self.depth_proj is not None:
+                for param in self.depth_proj.parameters():
+                    if param.requires_grad:
+                        dummy_term = dummy_term + 0.0 * param.sum()
             eagle_embeds = eagle_embeds + dummy_term
 
         return BatchFeature(
@@ -607,18 +495,23 @@ class GR00TN15(PreTrainedModel):
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
         
-        # Depth modality settings (following "Modality-Augmented Fine-Tuning" paper)
+        # Depth branch settings
         use_depth = kwargs.pop("use_depth", False)
-        depth_weight_init = kwargs.pop("depth_weight_init", "rgb_average")
+        depth_fourier_dim = kwargs.pop("depth_fourier_dim", 64)
+        depth_hidden_dim = kwargs.pop("depth_hidden_dim", 256)
+        depth_min_freq = kwargs.pop("depth_min_freq", 1.0)
+        depth_max_freq = kwargs.pop("depth_max_freq", 50.0)
+        depth_learnable_freqs = kwargs.pop("depth_learnable_freqs", False)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
         print(f"Tune action head DiT: {tune_diffusion_model}")
-        print(f"Use depth (RGB-D): {use_depth}")
+        print(f"Use depth branch: {use_depth}")
         if use_depth:
-            print(f"Depth weight initialization: {depth_weight_init}")
+            print(f"Depth branch config: fourier_dim={depth_fourier_dim}, hidden_dim={depth_hidden_dim}, "
+                  f"freq_range=[{depth_min_freq}, {depth_max_freq}], learnable_freqs={depth_learnable_freqs}")
 
         # Download model or use local path
         try:
@@ -628,119 +521,111 @@ class GR00TN15(PreTrainedModel):
             local_model_path = pretrained_model_name_or_path
 
         # Detect if this is a LeRobot checkpoint (for eval) or HuggingFace model (for training)
-        # LeRobot checkpoints have keys prefixed with "_groot_model."
-        # Also check if checkpoint has 4-channel patch embedding (depth-trained)
         safetensor_path = os.path.join(local_model_path, "model.safetensors")
         is_lerobot_checkpoint = False
-        checkpoint_has_4_channels = False
-        
-        patch_embed_key = "_groot_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding.weight"
-        
-        def _print_patch_embed_weights(weights, label, use_depth_flag):
-            """Print first few weights of each channel for debugging."""
-            # weights shape: (out_channels, in_channels, H, W) for Conv2d
-            print(f"\n[GROOT PATCH EMBED DEBUG] {label}")
-            print(f"  Shape: {weights.shape}")
-            # Flatten spatial dims and take first 5 values per channel
-            flat = weights[:, :, :, :].reshape(weights.shape[0], weights.shape[1], -1)
-            # Take first output channel, first few spatial values
-            for ch, name in enumerate(['R', 'G', 'B']):
-                if ch < weights.shape[1]:
-                    vals = flat[0, ch, :5].tolist()
-                    print(f"  Channel {name}: {[f'{v:.6f}' for v in vals]}")
-            if use_depth_flag and weights.shape[1] >= 4:
-                vals = flat[0, 3, :5].tolist()
-                print(f"  Channel D: {[f'{v:.6f}' for v in vals]}")
-            print("")
-        
+
         if os.path.exists(safetensor_path):
             try:
                 from safetensors import safe_open
                 with safe_open(safetensor_path, framework="pt", device="cpu") as f:
                     all_keys = list(f.keys())
                     is_lerobot_checkpoint = any(k.startswith("_groot_model.") for k in all_keys[:10])
-                    
-                    if patch_embed_key in all_keys:
-                        weights = f.get_tensor(patch_embed_key)
-                        shape = weights.shape
-                        checkpoint_has_4_channels = (shape[1] == 4)
-                        print(f"[GROOT] Checkpoint patch embedding: {shape} ({'4-ch depth' if checkpoint_has_4_channels else '3-ch RGB'})")
-                        _print_patch_embed_weights(weights, "Stage 1: From safetensor file", use_depth)
+                    patch_embed_keys = [
+                        "_groot_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding.weight",
+                        "_groot_model.backbone.depth_branch.patch_embedding.cnn.0.weight",
+                        "_groot_model.backbone.depth_branch.patch_embedding.cnn.0.bias",
+                        "_groot_model.backbone.depth_branch.patch_embedding.cnn.3.weight",
+                        "_groot_model.backbone.depth_branch.patch_embedding.cnn.3.bias",
+                        "_groot_model.backbone.depth_branch.patch_embedding.gate.weight",
+                        "_groot_model.backbone.depth_branch.patch_embedding.gate.bias",
+                    ]
+                    for patch_embed_key in patch_embed_keys:
+                        if patch_embed_key in all_keys:
+                            weights = f.get_tensor(patch_embed_key)
+                            shape = weights.shape
+                            print(f"Patch embed key: {patch_embed_key}: shape={shape}")
+                            print(f"  Sample weights start: {weights.flatten()[0:5]}")
+                            print(f"  Sample weights end: {weights.flatten()[-5:]}")
             except Exception as e:
                 print(f"[GROOT] Warning: Could not inspect checkpoint: {e}")
-        
+
+        # Depth branch config to inject into backbone_cfg
+        depth_cfg_kwargs = {
+            "use_depth": use_depth,
+            "depth_fourier_dim": depth_fourier_dim,
+            "depth_hidden_dim": depth_hidden_dim,
+            "depth_min_freq": depth_min_freq,
+            "depth_max_freq": depth_max_freq,
+            "depth_learnable_freqs": depth_learnable_freqs,
+        }
+
         if is_lerobot_checkpoint:
             # EVAL FLOW: Loading a LeRobot-saved checkpoint
-            # We just need to create the model with correct architecture.
-            # Weights will be loaded by PreTrainedPolicy.from_pretrained via load_model_as_safetensor.
             print("[GROOT] Detected LeRobot checkpoint format (eval flow)")
-            
-            # LeRobot's config.json doesn't have backbone_cfg, so load from base model
+
             import json
             base_model_name = "nvidia/GR00T-N1.5-3B"
             try:
                 base_model_path = snapshot_download(base_model_name, repo_type="model")
             except (HFValidationError, RepositoryNotFoundError):
                 raise RuntimeError(f"Cannot download base GROOT model config from {base_model_name}")
-            
+
             config_path = os.path.join(base_model_path, "config.json")
             with open(config_path, "r") as f:
                 config_dict = json.load(f)
-            
-            # Inject depth settings - extend in __init__ since checkpoint has 4-ch weights
-            if use_depth and "backbone_cfg" in config_dict:
-                config_dict["backbone_cfg"]["use_depth"] = use_depth
-                config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
-                config_dict["backbone_cfg"]["_skip_depth_init"] = False  # Extend in __init__
-            
+
+            if "backbone_cfg" in config_dict:
+                config_dict["backbone_cfg"].update(depth_cfg_kwargs)
+
             config = cls.config_class(**config_dict)
-            
-            # Create model with correct architecture (4-ch if depth)
-            # Don't load weights here - load_model_as_safetensor will handle it
             pretrained_model = cls(config, local_model_path=local_model_path)
-            
-            # Print weights after model creation (before external loading by PreTrainedPolicy)
-            patch_embed = pretrained_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-            _print_patch_embed_weights(patch_embed.weight.data, "Stage 2: Model created with random init (checkpoint will be loaded next by PreTrainedPolicy)", use_depth)
-            print("[GROOT] Note: Stage 2 shows random weights - this is expected. Stage 3 will show correct weights after checkpoint loading.")
-            
+            # Weights will be loaded by PreTrainedPolicy.from_pretrained via load_model_as_safetensor
+
         else:
             # TRAINING FLOW: Loading from HuggingFace (base model)
-            # Need to load 3-ch weights first, then extend to 4-ch with rgb_average
             print("[GROOT] Detected HuggingFace checkpoint format (training flow)")
-            
+
             if use_depth:
                 import json
                 config_path = Path(local_model_path) / "config.json"
                 with open(config_path, "r") as f:
                     config_dict = json.load(f)
-                
+
                 if "backbone_cfg" in config_dict:
-                    config_dict["backbone_cfg"]["use_depth"] = use_depth
-                    config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
-                    config_dict["backbone_cfg"]["_skip_depth_init"] = True  # Don't extend in __init__
-                
+                    config_dict["backbone_cfg"].update(depth_cfg_kwargs)
+
                 config = cls.config_class(**config_dict)
                 kwargs["config"] = config
-            
+
             # Use HuggingFace's from_pretrained to load base model weights
+            # The RGB patch embedding stays 3-channel (no modification needed)
             pretrained_model = super().from_pretrained(
                 local_model_path, local_model_path=local_model_path, **kwargs
             )
-            
-            # Print weights after HuggingFace loading (Stage 2 & 3 combined - HF creates and loads in one step)
-            patch_embed = pretrained_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-            _print_patch_embed_weights(patch_embed.weight.data, "Stage 2+3: After HuggingFace from_pretrained (weights loaded)", use_depth)
-            
-            # Now extend to 4 channels using rgb_average of the loaded pretrained weights
-            if use_depth:
-                print("[GROOT] Extending patch embedding for depth (3→4 channels with rgb_average of pretrained weights)...")
-                pretrained_model.backbone.extend_patch_embedding_for_depth()
-                # Print weights after depth extension
-                patch_embed = pretrained_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-                _print_patch_embed_weights(patch_embed.weight.data, "Stage 4: After depth extension (3→4 channels)", use_depth)
-        
+
         if use_depth:
+            # Explicitly initialize ALL depth branch weights AFTER model construction.
+            # HuggingFace's from_pretrained wraps construction in no_init_weights()
+            # which replaces all torch.nn.init.* with no-ops, leaving new (non-pretrained)
+            # layers as uninitialized torch.empty() garbage — non-deterministic across runs.
+            # reset_parameters() uses direct tensor ops, so it works correctly and
+            # produces reproducible weights when a seed is set beforehand.
+            # For eval flow (LeRobot checkpoint), these weights will be overwritten
+            # when the checkpoint is loaded later.
+            pretrained_model.backbone.depth_branch.reset_parameters()
+            # Zero-init depth_proj so depth tokens start as TRUE zeros.
+            # The depth_branch gate is zero-init → its output is zeros, but
+            # nn.Linear.reset_parameters() gives a non-zero bias, so
+            # depth_proj(zeros) = bias ≈ 0.03 → 256 non-zero constant tokens
+            # that disrupt pretrained attention patterns after LayerNorm.
+            # By zero-initing weight AND bias, depth tokens are exactly zero
+            # at init and gradually "turn on" as the depth branch learns.
+            pretrained_model.backbone.depth_proj.weight.data.zero_()
+            pretrained_model.backbone.depth_proj.bias.data.zero_()
+            print(f"[GROOT] depth_proj zero-initialized (weight norm: "
+                  f"{pretrained_model.backbone.depth_proj.weight.data.norm().item()}, "
+                  f"bias norm: {pretrained_model.backbone.depth_proj.bias.data.norm().item()})")
+
             pretrained_model.backbone.register_depth_gradient_hook(log_every_n_steps=1000)
 
         pretrained_model.backbone.set_trainable_parameters(tune_visual=tune_visual, tune_llm=tune_llm)

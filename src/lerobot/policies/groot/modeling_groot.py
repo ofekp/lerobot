@@ -91,7 +91,11 @@ class GrootPolicy(PreTrainedPolicy):
             tune_projector=self.config.tune_projector,
             tune_diffusion_model=self.config.tune_diffusion_model,
             use_depth=self.config.use_depth,
-            depth_weight_init=self.config.depth_weight_init,
+            depth_fourier_dim=self.config.depth_fourier_dim,
+            depth_hidden_dim=self.config.depth_hidden_dim,
+            depth_min_freq=self.config.depth_min_freq,
+            depth_max_freq=self.config.depth_max_freq,
+            depth_learnable_freqs=self.config.depth_learnable_freqs,
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype

@@ -148,22 +148,25 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         # Debug: Print patch embedding weights after loading (Stage 3)
         # This helps verify weights were loaded correctly from checkpoint
         if hasattr(model, '_groot_model') and hasattr(model._groot_model, 'backbone'):
-            try:
-                patch_embed = model._groot_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-                weights = patch_embed.weight.data
-                print(f"\n[GROOT PATCH EMBED DEBUG] Stage 3: After load_model_as_safetensor")
-                print(f"  Shape: {weights.shape}")
-                flat = weights[:, :, :, :].reshape(weights.shape[0], weights.shape[1], -1)
-                for ch, name in enumerate(['R', 'G', 'B']):
-                    if ch < weights.shape[1]:
-                        vals = flat[0, ch, :5].tolist()
-                        print(f"  Channel {name}: {[f'{v:.6f}' for v in vals]}")
-                if weights.shape[1] >= 4:
-                    vals = flat[0, 3, :5].tolist()
-                    print(f"  Channel D: {[f'{v:.6f}' for v in vals]}")
-                print("")
-            except Exception as e:
-                print(f"[GROOT] Could not print Stage 3 weights: {e}")
+            print(f"\n[GROOT PATCH EMBED DEBUG] Stage 3: After load_model_as_safetensor")
+            patch_embed_keys = [
+                "_groot_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding.weight",
+                "_groot_model.backbone.depth_branch.patch_embedding.cnn.0.weight",
+                "_groot_model.backbone.depth_branch.patch_embedding.cnn.0.bias",
+                "_groot_model.backbone.depth_branch.patch_embedding.cnn.3.weight",
+                "_groot_model.backbone.depth_branch.patch_embedding.cnn.3.bias",
+                "_groot_model.backbone.depth_branch.patch_embedding.gate.weight",
+                "_groot_model.backbone.depth_branch.patch_embedding.gate.bias",
+            ]
+            model_state_dict = model.state_dict()
+            for patch_embed_key in patch_embed_keys:
+                all_keys = model_state_dict.keys()
+                if patch_embed_key in all_keys:
+                    weights = model_state_dict[patch_embed_key]
+                    shape = weights.shape
+                    print(f"Patch embed key: {patch_embed_key}: shape={shape}")
+                    print(f"  Sample weights start: {weights.flatten()[0:5]}")
+                    print(f"  Sample weights end: {weights.flatten()[-5:]}")
 
         # For older versions, manually move to device if needed
         if "device" not in kwargs and map_location != "cpu":
