@@ -190,7 +190,7 @@ class LiberoEnv(gym.Env):
         self.episode_length = episode_length
         # Load once and keep
         self._init_states = get_task_init_states(task_suite, self.task_id) if self.init_states else None
-        self._init_state_id = self.episode_index  # tie each sub-env to a fixed init state
+        self._init_state_id = self.episode_index  # used on first reset and auto-resets
 
         self._env = self._make_envs_task(task_suite, self.task_id)
         default_steps = 500
@@ -458,6 +458,18 @@ class LiberoEnv(gym.Env):
         self._env.seed(seed)
         raw_obs = self._env.reset()
         if self.init_states and self._init_states is not None:
+            if seed is not None:
+                # Real reset from eval loop — use seed to select init state.
+                # SyncVectorEnv gives each sub-env a unique incrementing seed,
+                # so seed % n_init naturally cycles through all init states
+                # without overlap between parallel sub-envs.
+                n_init = len(self._init_states)
+                self._init_state_id = seed % n_init
+                print(
+                    f"[LIBERO] sub-env {self.episode_index} reset (seed={seed}) → "
+                    f"init_state[{self._init_state_id}] (of {n_init})"
+                )
+            # else: auto-reset from step() — reuse current _init_state_id
             self._env.set_init_state(self._init_states[self._init_state_id])
             raw_obs = self._env.env._get_observations()
 
@@ -505,7 +517,7 @@ class LiberoEnv(gym.Env):
                 "done": bool(done),
                 "is_success": bool(is_success),
             }
-            self.reset()
+            self.reset()  # auto-reset: seed=None → reuses current init state
         truncated = False
         return observation, reward, terminated, truncated, info
 
@@ -589,9 +601,7 @@ def create_libero_envs(
     if not suite_names:
         raise ValueError("`task` must contain at least one LIBERO suite name.")
 
-    print(
-        f"Creating LIBERO envs | suites={suite_names} | n_envs(per task)={n_envs} | init_states={init_states}"
-    )
+    print(f"Creating LIBERO envs | suites={suite_names} | n_envs(per task)={n_envs} | init_states={init_states}")
     if task_ids_filter is not None:
         print(f"Restricting to task_ids={task_ids_filter}")
 
@@ -603,6 +613,8 @@ def create_libero_envs(
         if not selected:
             raise ValueError(f"No tasks selected for suite '{suite_name}' (available: {total}).")
 
+        print(f"Building envs for suite '{suite_name}' with {len(selected)} tasks (task_ids={selected})...")
+
         for tid in selected:
             fns = _make_env_fns(
                 suite=suite,
@@ -611,7 +623,7 @@ def create_libero_envs(
                 task_id=tid,
                 n_envs=n_envs,
                 camera_names=camera_names,
-                init_states=init_states,
+                init_states=init_states,  # this is just a boolean, the actual init states are loaded by get_task_init_states per task inside LiberoEnv
                 gym_kwargs=gym_kwargs,
                 control_mode=control_mode,
             )
