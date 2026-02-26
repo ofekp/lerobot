@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
 
@@ -155,9 +156,14 @@ def make_groot_pre_post_processors(
             depth_mean=getattr(config, 'depth_mean', 0.5),
             depth_std=getattr(config, 'depth_std', 0.5),
         ),
-        # 6. Move to device
-        DeviceProcessorStep(device=config.device),
     ]
+
+    # 6. Add voxel prep step if enabled
+    if getattr(config, 'use_voxel', False):
+        input_steps.append(GrootVoxelPrepStep())
+
+    # 7. Move to device (always last)
+    input_steps.append(DeviceProcessorStep(device=config.device))
 
     # Postprocessing: slice to env action dim and unnormalize to env scale, then move to CPU
     output_steps: list[ProcessorStep] = [
@@ -852,6 +858,79 @@ class GrootEagleCollateStep(ProcessorStep):
         obs.pop(
             "video", None
         )  # The video has been fully encoded into eagle_* tensors, so we don't need the raw video anymore
+        transition[TransitionKey.OBSERVATION] = obs
+        transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+        return transition
+
+    def transform_features(self, features):
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="groot_voxel_prep_v1")
+class GrootVoxelPrepStep(ProcessorStep):
+    """Prepare voxel encoder inputs from RGB-D and camera params.
+
+    Extracts depth, RGB, intrinsics, and extrinsics from observations
+    and stores them as voxel_* keys in complementary data for the
+    EagleBackbone to pass to VoxelEncoder.
+    """
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
+        comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+
+        intrinsics = obs.get("observation.camera_intrinsics")
+        extrinsics = obs.get("observation.camera_extrinsics")
+
+        if intrinsics is None or extrinsics is None:
+            transition[TransitionKey.OBSERVATION] = obs
+            transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+            return transition
+
+        # Get depth from depth_raw (set by GrootPackInputsStep)
+        depth_raw = obs.get("depth_raw")
+        if depth_raw is None:
+            transition[TransitionKey.OBSERVATION] = obs
+            transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+            return transition
+
+        # depth_raw: (B, 1, V, 1, H, W) — take first timestep, first view
+        B, T, V, C, H, W = depth_raw.shape
+        voxel_depth = depth_raw[:, 0, 0, :, :, :]  # (B, 1, H, W)
+        voxel_depth = voxel_depth.to(torch.float32)
+        # Convert mm to meters if needed
+        if voxel_depth.max() > 100:
+            voxel_depth = voxel_depth / 1000.0
+
+        # Get RGB from eagle_pixel_values (normalized by Eagle processor)
+        eagle_pv = comp.get("eagle_pixel_values")
+        if eagle_pv is not None:
+            voxel_rgb = eagle_pv[:, :3, :, :] * 0.5 + 0.5  # denormalize to [0,1]
+            # Resize depth to match Eagle spatial dims
+            _, _, h_rgb, w_rgb = voxel_rgb.shape
+            _, _, h_d, w_d = voxel_depth.shape
+            if h_d != h_rgb or w_d != w_rgb:
+                voxel_depth = F.interpolate(
+                    voxel_depth, size=(h_rgb, w_rgb), mode='nearest'
+                )
+        else:
+            voxel_rgb = torch.zeros(
+                B, 3, voxel_depth.shape[2], voxel_depth.shape[3],
+                device=voxel_depth.device,
+            )
+
+        # Ensure batch dim on camera params
+        if isinstance(intrinsics, torch.Tensor) and intrinsics.dim() == 2:
+            intrinsics = intrinsics.unsqueeze(0).expand(B, -1, -1)
+        if isinstance(extrinsics, torch.Tensor) and extrinsics.dim() == 2:
+            extrinsics = extrinsics.unsqueeze(0).expand(B, -1, -1)
+
+        comp["voxel_depth"] = voxel_depth
+        comp["voxel_rgb"] = voxel_rgb
+        comp["voxel_intrinsics"] = intrinsics.to(torch.float32) if isinstance(intrinsics, torch.Tensor) else intrinsics
+        comp["voxel_extrinsics"] = extrinsics.to(torch.float32) if isinstance(extrinsics, torch.Tensor) else extrinsics
+
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
         return transition

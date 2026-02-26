@@ -83,6 +83,8 @@ class GrootPolicy(PreTrainedPolicy):
         print(f"  tune_projector={self.config.tune_projector}")
         print(f"  tune_diffusion_model={self.config.tune_diffusion_model}")
         print(f"  use_depth={self.config.use_depth}")
+        print(f"  use_voxel={self.config.use_voxel}")
+        print(f"  voxel_grid_size={self.config.voxel_grid_size}")
 
         model = GR00TN15.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -92,6 +94,9 @@ class GrootPolicy(PreTrainedPolicy):
             tune_diffusion_model=self.config.tune_diffusion_model,
             use_depth=self.config.use_depth,
             depth_weight_init=self.config.depth_weight_init,
+            use_voxel=self.config.use_voxel,
+            voxel_grid_size=self.config.voxel_grid_size,
+            voxel_workspace_bounds=self.config.voxel_workspace_bounds,
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype

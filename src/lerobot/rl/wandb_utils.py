@@ -33,7 +33,15 @@ def cfg_to_group(cfg: TrainPipelineConfig, return_list: bool = False) -> list[st
         f"seed:{cfg.seed}",
     ]
     if cfg.dataset is not None:
-        lst.append(f"dataset:{cfg.dataset.repo_id}")
+        # Truncate repo_id to avoid WandB's 64-char tag limit
+        repo_id = cfg.dataset.repo_id
+        tag = f"dataset:{repo_id}"
+        if len(tag) > 64:
+            # Use only the last path component (task name)
+            tag = f"dataset:{repo_id.rstrip('/').rsplit('/', 1)[-1]}"
+        if len(tag) > 64:
+            tag = tag[:64]
+        lst.append(tag)
     if cfg.env is not None:
         lst.append(f"env:{cfg.env.type}")
     return lst if return_list else "-".join(lst)

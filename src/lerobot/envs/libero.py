@@ -158,6 +158,7 @@ class LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         use_depth: bool = False,
+        use_voxel: bool = False,
     ):
         super().__init__()
         self.task_id = task_id
@@ -169,6 +170,7 @@ class LiberoEnv(gym.Env):
         self.visualization_height = visualization_height
         self.init_states = init_states
         self.use_depth = use_depth
+        self.use_voxel = use_voxel
         self.camera_name = _parse_camera_names(
             camera_name
         )  # agentview_image (main) or robot0_eye_in_hand_image (wrist)
@@ -301,7 +303,29 @@ class LiberoEnv(gym.Env):
                 depth_rgb = np.stack([depth_vis, depth_vis, depth_vis], axis=-1)
                 # Concatenate horizontally: [RGB | Depth]
                 image = np.concatenate([image, depth_rgb], axis=1)
-        
+
+        # If voxel encoder is active, add voxel projection to the right
+        if self.use_voxel:
+            try:
+                from lerobot.policies.groot.voxel_encoder import (
+                    _voxel_grid_cache,
+                    render_voxel_projections,
+                )
+                if _voxel_grid_cache is not None:
+                    voxel_img = render_voxel_projections(_voxel_grid_cache, scale=1)
+                    # Resize voxel image to match the height of the render
+                    h_target = image.shape[0]
+                    h_vox, w_vox = voxel_img.shape[:2]
+                    if h_vox != h_target:
+                        from PIL import Image as _PILImage
+                        w_new = int(w_vox * h_target / h_vox)
+                        voxel_img = np.array(
+                            _PILImage.fromarray(voxel_img).resize((w_new, h_target), _PILImage.NEAREST)
+                        )
+                    image = np.concatenate([image, voxel_img], axis=1)
+            except Exception:
+                pass  # visualization is best-effort
+
         return image
 
     def _make_envs_task(self, task_suite: Any, task_id: int = 0):
@@ -428,6 +452,35 @@ class LiberoEnv(gym.Env):
         if self.use_depth:
             obs["depths"] = depths
 
+        # Extract camera intrinsics/extrinsics for voxel encoder
+        if self.use_voxel:
+            sim = self._env.env.sim
+            cam_name_base = self.camera_name[0].replace("_image", "")
+            cam_id = sim.model.camera_name2id(cam_name_base)
+
+            # Intrinsics from FOV
+            fovy = sim.model.cam_fovy[cam_id]
+            f = (self.observation_height / 2.0) / np.tan(np.radians(fovy) / 2.0)
+            cx = self.observation_width / 2.0
+            cy = self.observation_height / 2.0
+            intrinsics = np.array([
+                [f,  0, cx],
+                [0,  f, cy],
+                [0,  0,  1],
+            ], dtype=np.float32)
+
+            # Extrinsics (per-frame, handles dynamic cameras)
+            cam_pos = sim.data.cam_xpos[cam_id].copy()
+            cam_rot = sim.data.cam_xmat[cam_id].reshape(3, 3).copy()
+            R_wc = cam_rot.T
+            t_wc = -R_wc @ cam_pos
+            extrinsics = np.eye(4, dtype=np.float32)
+            extrinsics[:3, :3] = R_wc
+            extrinsics[:3, 3] = t_wc
+
+            obs["camera_intrinsics"] = intrinsics
+            obs["camera_extrinsics"] = extrinsics
+
         # images['image'].shape --> (256, 256, 3), uint8
         # images['image.depth'].shape --> (256, 256), millimeters as uint16
         # self.obs_type is "pixels_agent_pos"
@@ -436,6 +489,9 @@ class LiberoEnv(gym.Env):
             result = {"pixels": images.copy()}
             if self.use_depth:
                 result["depths"] = depths.copy()
+            if self.use_voxel:
+                result["camera_intrinsics"] = obs["camera_intrinsics"]
+                result["camera_extrinsics"] = obs["camera_extrinsics"]
             return result
 
         if self.obs_type == "pixels_agent_pos":
@@ -560,6 +616,7 @@ def create_libero_envs(
     control_mode: str = "relative",
     episode_length: int | None = None,
     use_depth: bool = False,
+    use_voxel: bool = False,
     camera_name_mapping: dict[str, str] | None = None,
 ) -> dict[str, dict[int, Any]]:
     """
@@ -579,8 +636,9 @@ def create_libero_envs(
 
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
-    # Add use_depth and camera_name_mapping to gym_kwargs so they get passed to LiberoEnv.__init__
+    # Add use_depth, use_voxel, and camera_name_mapping to gym_kwargs so they get passed to LiberoEnv.__init__
     gym_kwargs["use_depth"] = use_depth
+    gym_kwargs["use_voxel"] = use_voxel
     if camera_name_mapping is not None:
         gym_kwargs["camera_name_mapping"] = camera_name_mapping
 

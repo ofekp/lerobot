@@ -74,6 +74,15 @@ class GrootConfig(PreTrainedConfig):
     depth_mean: float = 0.5       # Mean for centering
     depth_std: float = 0.5        # Std for scaling
 
+    # Voxel encoder settings (PerAct-inspired 3D spatial reasoning)
+    use_voxel: bool = False
+    voxel_grid_size: int = 40
+    voxel_workspace_bounds: tuple[tuple[float, float], ...] = (
+        (-0.3, 0.3),   # x: left-right
+        (-0.3, 0.3),   # y: forward-back
+        (0.6, 1.0),    # z: table surface to above
+    )
+
     # Groot-specific model parameters (from groot_finetune_script.py)
 
     # Path or HuggingFace model ID for the base Groot model
