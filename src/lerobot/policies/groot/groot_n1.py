@@ -22,6 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
 
@@ -119,24 +120,17 @@ class EagleBackbone(nn.Module):
             self.eagle_linear = torch.nn.Identity()
 
         hidden_dim = 2048  # eagle_linear input dim
-
-        # CHNet depth processing (only when depth is enabled)
+        # Derive vit_dim from actual model config instead of hardcoding
+        vit_dim = getattr(config.vision_config, 'hidden_size', 1152)
+        self.chnet = CHNetDepthProcessor(
+            vit_dim=vit_dim,
+            hidden_dim=hidden_dim,
+            channels=tuple(chnet_channels),
+        )
         self._chnet_tap_layers = tuple(chnet_tap_layers)
         self._vit_hook_features = {}
-        self._vit_hooks = []
-        if self.use_depth:
-            # Derive vit_dim from actual model config instead of hardcoding
-            vit_dim = getattr(config.vision_config, 'hidden_size', 1152)
-            self.chnet = CHNetDepthProcessor(
-                vit_dim=vit_dim,
-                hidden_dim=hidden_dim,
-                channels=tuple(chnet_channels),
-            )
-            self._register_vit_hooks()
-            print(f"[GROOT] CHNet depth processor initialized (vit_dim={vit_dim}, hidden_dim={hidden_dim}, tapping ViT layers {chnet_tap_layers})")
-        else:
-            self.chnet = None
-            print("[GROOT] CHNet disabled (use_depth=False)")
+        self._register_vit_hooks()
+        print(f"[GROOT] CHNet depth processor initialized (vit_dim={vit_dim}, hidden_dim={hidden_dim}, tapping ViT layers {chnet_tap_layers})")
 
         # needed since we don't use these layers. Also saves compute
         while len(self.eagle_model.language_model.model.layers) > select_layer:
@@ -179,6 +173,42 @@ class EagleBackbone(nn.Module):
             return grad
         self._depth_grad_hook_handle = patch_embed.weight.register_hook(hook)
         print(f"[GROOT] Depth gradient hook registered (logging every {log_every_n_steps} steps)")
+
+    def _register_vit_hooks(self):
+        """Register forward hooks on ViT layers to capture intermediate features for CHNet."""
+        try:
+            vit_layers = self.eagle_model.vision_model.vision_model.encoder.layers
+        except AttributeError:
+            try:
+                vit_layers = self.eagle_model.vision_model.encoder.layers
+            except AttributeError:
+                raise RuntimeError(
+                    "[GROOT] Cannot find ViT encoder layers for CHNet hooks."
+                )
+
+        self._vit_hooks = []
+        for layer_idx in self._chnet_tap_layers:
+            if layer_idx >= len(vit_layers):
+                raise ValueError(
+                    f"[GROOT] ViT layer index {layer_idx} out of range "
+                    f"(model has {len(vit_layers)} layers)"
+                )
+            handle = vit_layers[layer_idx].register_forward_hook(
+                self._make_vit_hook(layer_idx)
+            )
+            self._vit_hooks.append(handle)
+        print(f"[GROOT] Registered {len(self._vit_hooks)} ViT hooks for CHNet")
+
+    def _make_vit_hook(self, layer_idx):
+        """Create a hook closure for a specific ViT layer."""
+        def hook(module, input, output):
+            # detach() because Eagle ViT is frozen — no need to track ViT computation graph.
+            # Gradients still flow through CHNet's projectors and FastGuide modules.
+            if isinstance(output, tuple):
+                self._vit_hook_features[layer_idx] = output[0].detach()
+            else:
+                self._vit_hook_features[layer_idx] = output.detach()
+        return hook
 
     def _register_vit_hooks(self):
         """Register forward hooks on ViT layers to capture intermediate features for CHNet."""
@@ -386,11 +416,11 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
-        # CHNet modules live on self.chnet (not under eagle_model), so they are
-        # unaffected by the LLM/ViT freezing above. Explicitly ensure trainability.
-        if self.chnet is not None:
-            self.chnet.requires_grad_(True)
-            print("[GROOT] CHNet modules set to trainable")
+        #Ofek please double check me here, I think I just cancelled training the DiT
+        for name, p in self.named_parameters():
+            if 'chnet' in name:
+                p.requires_grad = True
+        print(f"[GROOT] CHNet modules set to trainable")
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -449,7 +479,13 @@ class EagleBackbone(nn.Module):
         # Extract depth for CHNet before removing non-Eagle keys
         depth_normalized = eagle_input.pop("depth_normalized", None)
 
+
+        # Extract depth for CHNet before removing non-Eagle keys
+        depth_normalized = eagle_input.pop("depth_normalized", None)
+
         del eagle_input["image_sizes"]
+
+
 
         # Verify depth is flowing through when expected
         if not hasattr(self, '_depth_fwd_count'):
@@ -862,6 +898,8 @@ class GR00TN15(PreTrainedModel):
                     config_dict["backbone_cfg"]["use_depth"] = use_depth
                     config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
                     config_dict["backbone_cfg"]["_skip_depth_init"] = True  # Don't extend in __init__
+                    config_dict["backbone_cfg"]["chnet_tap_layers"] = chnet_tap_layers
+                    config_dict["backbone_cfg"]["chnet_channels"] = chnet_channels
                     config_dict["backbone_cfg"]["chnet_tap_layers"] = chnet_tap_layers
                     config_dict["backbone_cfg"]["chnet_channels"] = chnet_channels
                 

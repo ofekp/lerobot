@@ -83,6 +83,13 @@ class GrootConfig(PreTrainedConfig):
     # Channel widths for the 4-stage depth CNN encoder
     chnet_channels: tuple[int, ...] = (64, 128, 256, 256)
 
+    # ViT layer indices to tap for FastGuide guidance (0-indexed)
+    # Default: 4 evenly-spaced layers in a 24-layer SigLIP ViT
+    chnet_tap_layers: tuple[int, ...] = (5, 11, 17, 23)
+
+    # Channel widths for the 4-stage depth CNN encoder
+    chnet_channels: tuple[int, ...] = (64, 128, 256, 256)
+
     # Groot-specific model parameters (from groot_finetune_script.py)
 
     # Path or HuggingFace model ID for the base Groot model
