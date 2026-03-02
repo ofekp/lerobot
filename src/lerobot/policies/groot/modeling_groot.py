@@ -94,6 +94,8 @@ class GrootPolicy(PreTrainedPolicy):
             tune_diffusion_model=self.config.tune_diffusion_model,
             use_depth=self.config.use_depth,
             depth_weight_init=self.config.depth_weight_init,
+            chnet_tap_layers=getattr(self.config, 'chnet_tap_layers', (5, 11, 17, 23)),
+            chnet_channels=getattr(self.config, 'chnet_channels', (64, 128, 256, 256)),
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype

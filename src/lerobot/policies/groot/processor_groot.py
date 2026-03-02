@@ -905,9 +905,10 @@ class GrootEagleCollateStep(ProcessorStep):
             # our scaling is not doing anything on purpose (mean 0, std 1, scale 1) given in the cli command
             # depth_flat == depth_normalized and are in meters
 
-            # Concatenate depth as 4th channel: (N, 4, H', W')
-            pixel_values_rgbd = torch.cat([pixel_values, depth_normalized], dim=1)
-            comp["eagle_pixel_values"] = pixel_values_rgbd
+            # CHNet mode: pass depth separately for the depth CNN encoder
+            # Store as eagle_ prefix so it flows through to the backbone
+            comp["eagle_depth_normalized"] = depth_normalized
+            # pixel_values stays 3-channel RGB
             
             # Clean up depth_raw
             obs.pop("depth_raw", None)

@@ -21,10 +21,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
 
 from lerobot.utils.import_utils import _transformers_available
+from lerobot.policies.groot.chnet_modules import CHNetDepthProcessor
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
@@ -68,6 +70,8 @@ class EagleBackbone(nn.Module):
         use_depth: bool = False,
         depth_weight_init: str = "rgb_average",
         _skip_depth_init: bool = False,
+        chnet_tap_layers: tuple = (5, 11, 17, 23),
+        chnet_channels: tuple = (64, 128, 256, 256),
     ):
         """
         Args:
@@ -114,6 +118,19 @@ class EagleBackbone(nn.Module):
         else:
             self.eagle_linear = torch.nn.Identity()
 
+        hidden_dim = 2048  # eagle_linear input dim
+        # Derive vit_dim from actual model config instead of hardcoding
+        vit_dim = getattr(config.vision_config, 'hidden_size', 1152)
+        self.chnet = CHNetDepthProcessor(
+            vit_dim=vit_dim,
+            hidden_dim=hidden_dim,
+            channels=tuple(chnet_channels),
+        )
+        self._chnet_tap_layers = tuple(chnet_tap_layers)
+        self._vit_hook_features = {}
+        self._register_vit_hooks()
+        print(f"[GROOT] CHNet depth processor initialized (vit_dim={vit_dim}, hidden_dim={hidden_dim}, tapping ViT layers {chnet_tap_layers})")
+
         # needed since we don't use these layers. Also saves compute
         while len(self.eagle_model.language_model.model.layers) > select_layer:
             self.eagle_model.language_model.model.layers.pop(-1)
@@ -155,6 +172,42 @@ class EagleBackbone(nn.Module):
             return grad
         self._depth_grad_hook_handle = patch_embed.weight.register_hook(hook)
         print(f"[GROOT] Depth gradient hook registered (logging every {log_every_n_steps} steps)")
+
+    def _register_vit_hooks(self):
+        """Register forward hooks on ViT layers to capture intermediate features for CHNet."""
+        try:
+            vit_layers = self.eagle_model.vision_model.vision_model.encoder.layers
+        except AttributeError:
+            try:
+                vit_layers = self.eagle_model.vision_model.encoder.layers
+            except AttributeError:
+                raise RuntimeError(
+                    "[GROOT] Cannot find ViT encoder layers for CHNet hooks."
+                )
+
+        self._vit_hooks = []
+        for layer_idx in self._chnet_tap_layers:
+            if layer_idx >= len(vit_layers):
+                raise ValueError(
+                    f"[GROOT] ViT layer index {layer_idx} out of range "
+                    f"(model has {len(vit_layers)} layers)"
+                )
+            handle = vit_layers[layer_idx].register_forward_hook(
+                self._make_vit_hook(layer_idx)
+            )
+            self._vit_hooks.append(handle)
+        print(f"[GROOT] Registered {len(self._vit_hooks)} ViT hooks for CHNet")
+
+    def _make_vit_hook(self, layer_idx):
+        """Create a hook closure for a specific ViT layer."""
+        def hook(module, input, output):
+            # detach() because Eagle ViT is frozen — no need to track ViT computation graph.
+            # Gradients still flow through CHNet's projectors and FastGuide modules.
+            if isinstance(output, tuple):
+                self._vit_hook_features[layer_idx] = output[0].detach()
+            else:
+                self._vit_hook_features[layer_idx] = output.detach()
+        return hook
 
     def extend_patch_embedding_for_depth(self):
         """Public method to extend patch embedding for depth after pretrained weights are loaded.
@@ -324,19 +377,11 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
-        if self.use_depth:
-            # Enable gradients for the patch embedding but use a hook to zero out
-            # RGB gradients, following the paper's approach of only training depth weights
-            patch_embed = self.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-            patch_embed.weight.requires_grad = True
-            if patch_embed.bias is not None:
-                patch_embed.bias.requires_grad = True
-            
-            # Register gradient hook to only train depth channel (channel 3)
-            # This zeros out gradients for RGB channels (0:3), keeping only depth gradients
-            self._register_depth_only_gradient_hook(patch_embed)
-            print(f"[GROOT] Patch embedding: training ONLY depth channel (frozen RGB channels 0:3)")
-            print(f"Tune backbone patch embedding (depth): weight=True, bias={patch_embed.bias is not None}")
+        #Ofek please double check me here, I think I just cancelled training the DiT
+        for name, p in self.named_parameters():
+            if 'chnet' in name:
+                p.requires_grad = True
+        print(f"[GROOT] CHNet modules set to trainable")
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -391,10 +436,46 @@ class EagleBackbone(nn.Module):
         eagle_input = {
             k.removeprefix(eagle_prefix): v for k, v in vl_input.items() if k.startswith(eagle_prefix)
         }
+
+        # Extract depth for CHNet before removing non-Eagle keys
+        depth_normalized = eagle_input.pop("depth_normalized", None)
+
         del eagle_input["image_sizes"]
+
+        # Clear hook features before forward
+        self._vit_hook_features.clear()
 
         eagle_output = self.eagle_model(**eagle_input, output_hidden_states=True, return_dict=True)
         eagle_features = eagle_output.hidden_states[self.select_layer]
+
+        # CHNet depth processing
+        if depth_normalized is not None:
+            # Collect ViT intermediate features captured by hooks
+            vit_feats = [self._vit_hook_features[idx] for idx in self._chnet_tap_layers]
+
+            # Determine ViT spatial grid from pixel_values
+            pixel_values = eagle_input.get("pixel_values")
+            if pixel_values is not None:
+                _, _, h_pv, w_pv = pixel_values.shape
+                patch_size = 14  # SigLIP patch size
+                grid_h = h_pv // patch_size
+                grid_w = w_pv // patch_size
+            else:
+                grid_h = grid_w = 16  # fallback for 224x224
+
+            # Resize depth to match expected input size (224x224)
+            if depth_normalized.shape[-1] != 224 or depth_normalized.shape[-2] != 224:
+                depth_normalized = F.interpolate(
+                    depth_normalized, size=(224, 224), mode='nearest'
+                )
+
+            eagle_features = self.chnet(
+                depth=depth_normalized,
+                vit_features=vit_feats,
+                grid_h=grid_h,
+                grid_w=grid_w,
+                eagle_features=eagle_features,
+            )
 
         eagle_features = self.eagle_linear(eagle_features)
         return eagle_features, eagle_input["attention_mask"]
@@ -478,7 +559,8 @@ class GR00TN15(PreTrainedModel):
         
         # Track if depth is enabled (for validation)
         self.use_depth = config.backbone_cfg.get("use_depth", False)
-        self.expected_color_channels = 4 if self.use_depth else N_COLOR_CHANNELS
+        # CHNet keeps 3-channel ViT; legacy depth uses 4-channel
+        self.expected_color_channels = 3 if self.use_depth else N_COLOR_CHANNELS
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -611,6 +693,10 @@ class GR00TN15(PreTrainedModel):
         use_depth = kwargs.pop("use_depth", False)
         depth_weight_init = kwargs.pop("depth_weight_init", "rgb_average")
 
+        # CHNet settings (alternative depth processing with FastGuide)
+        chnet_tap_layers = kwargs.pop("chnet_tap_layers", (5, 11, 17, 23))
+        chnet_channels = kwargs.pop("chnet_channels", (64, 128, 256, 256))
+
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
@@ -687,11 +773,10 @@ class GR00TN15(PreTrainedModel):
             with open(config_path, "r") as f:
                 config_dict = json.load(f)
             
-            # Inject depth settings - extend in __init__ since checkpoint has 4-ch weights
+            # Inject depth settings 
             if use_depth and "backbone_cfg" in config_dict:
-                config_dict["backbone_cfg"]["use_depth"] = use_depth
-                config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
-                config_dict["backbone_cfg"]["_skip_depth_init"] = False  # Extend in __init__
+                config_dict["backbone_cfg"]["chnet_tap_layers"] = chnet_tap_layers
+                config_dict["backbone_cfg"]["chnet_channels"] = chnet_channels
             
             config = cls.config_class(**config_dict)
             
@@ -719,6 +804,8 @@ class GR00TN15(PreTrainedModel):
                     config_dict["backbone_cfg"]["use_depth"] = use_depth
                     config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
                     config_dict["backbone_cfg"]["_skip_depth_init"] = True  # Don't extend in __init__
+                    config_dict["backbone_cfg"]["chnet_tap_layers"] = chnet_tap_layers
+                    config_dict["backbone_cfg"]["chnet_channels"] = chnet_channels
                 
                 config = cls.config_class(**config_dict)
                 kwargs["config"] = config
@@ -733,15 +820,6 @@ class GR00TN15(PreTrainedModel):
             _print_patch_embed_weights(patch_embed.weight.data, "Stage 2+3: After HuggingFace from_pretrained (weights loaded)", use_depth)
             
             # Now extend to 4 channels using rgb_average of the loaded pretrained weights
-            if use_depth:
-                print("[GROOT] Extending patch embedding for depth (3→4 channels with rgb_average of pretrained weights)...")
-                pretrained_model.backbone.extend_patch_embedding_for_depth()
-                # Print weights after depth extension
-                patch_embed = pretrained_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-                _print_patch_embed_weights(patch_embed.weight.data, "Stage 4: After depth extension (3→4 channels)", use_depth)
-        
-        if use_depth:
-            pretrained_model.backbone.register_depth_gradient_hook(log_every_n_steps=1000)
 
         pretrained_model.backbone.set_trainable_parameters(tune_visual=tune_visual, tune_llm=tune_llm)
         pretrained_model.action_head.set_trainable_parameters(
