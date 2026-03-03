@@ -302,6 +302,14 @@ def eval_policy(
     # divisible by env.num_envs we end up discarding some data in the last batch.
     n_batches = n_episodes // env.num_envs + int((n_episodes % env.num_envs) != 0)
 
+    if start_seed is None and n_batches > 1:
+        logging.warning(
+            "No seed provided (--seed) but n_episodes > batch_size, so multiple batches are needed. "
+            "Without a seed, LIBERO environments cannot cycle through different init states across "
+            "batches — every batch will reuse the same init states. "
+            "Add --seed=<int> to your eval command to fix this."
+        )
+
     # Keep track of some metrics.
     sum_rewards = []
     max_rewards = []

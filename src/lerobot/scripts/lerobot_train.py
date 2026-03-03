@@ -286,8 +286,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     # Use accelerator's device
     device = accelerator.device
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
+
+    # Deterministic mode: sacrifice some performance for reproducibility.
+    # When a seed is set, force fully deterministic CUDA operations so that
+    # two training runs with the same seed produce bit-identical results.
+    if cfg.seed is not None:
+        import os
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+        torch.use_deterministic_algorithms(True, warn_only=False)
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
