@@ -148,6 +148,26 @@ def visualize_dataset(
                 else:
                     rr.log(key, rr.DepthImage(batch[key][i]))
 
+            # display camera intrinsics / extrinsics (float32 matrices)
+            for key, ft in dataset.meta.features.items():
+                if ft["dtype"] != "float32":
+                    continue
+                if key.endswith(".intrinsics"):
+                    # Log 3x3 intrinsics matrix as rr.Pinhole so rerun
+                    # can render a camera frustum in the 3D view.
+                    K = batch[key][i].numpy()  # (3, 3)
+                    rr.log(key, rr.Pinhole(image_from_camera=K))
+                elif key.endswith(".extrinsics"):
+                    # Log 4x4 extrinsics (cam-to-world) as rr.Transform3D.
+                    E = batch[key][i].numpy()  # (4, 4)
+                    rr.log(
+                        key,
+                        rr.Transform3D(
+                            mat3x3=E[:3, :3],
+                            translation=E[:3, 3],
+                        ),
+                    )
+
             # display each dimension of action space (e.g. actuators command)
             if ACTION in batch:
                 for dim_idx, val in enumerate(batch[ACTION][i]):

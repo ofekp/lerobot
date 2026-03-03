@@ -58,11 +58,21 @@ class VoxelGrid:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Unproject depth pixels into world-frame 3D points.
 
+        The extrinsics convention matches replay.py:
+            E[:3, :3] = R_cam_to_world  (cam_xmat, OpenGL axes)
+            E[:3, 3]  = cam_pos         (camera position in world)
+
+        Pipeline:
+            1. Flip depth vertically (OpenGL bottom-left → top-left origin)
+            2. Back-project via K^{-1} → points in OpenCV camera frame
+            3. Convert OpenCV → MuJoCo/OpenGL axes: [x, -y, -z]
+            4. Rotate to world: R_cam_to_world @ pts_mujoco + cam_pos
+
         Args:
             depth: ``(B, 1, H, W)`` depth map in metres.
             rgb: ``(B, 3, H, W)`` colour image in ``[0, 1]``.
             intrinsics: ``(B, 3, 3)`` camera intrinsic matrices.
-            extrinsics: ``(B, 4, 4)`` world-to-camera rigid transforms.
+            extrinsics: ``(B, 4, 4)`` cam-to-world ``[R_cam_to_world | cam_pos]``.
 
         Returns:
             points_world: ``(B, N, 3)`` 3D points in world frame.
@@ -71,6 +81,11 @@ class VoxelGrid:
         """
         B, _, H, W = depth.shape
         device = depth.device
+
+        # Step 1: Flip depth vertically — images from sim.render() are stored
+        # flipped (OpenGL origin bottom-left), so depth rows are inverted
+        # relative to the intrinsics convention (origin top-left).
+        depth = depth.flip(dims=[2])  # flip H dimension
 
         # Build pixel coordinate grid  --  (H, W) each
         v_coords, u_coords = torch.meshgrid(
@@ -90,18 +105,26 @@ class VoxelGrid:
         # Depth per pixel: (B, N)
         depth_flat = depth.reshape(B, -1)  # (B, N)
 
-        # Camera-frame 3D points: p_cam = K^{-1} * [u, v, 1]^T * d
+        # Step 2: Back-project to OpenCV camera frame
+        # p_cam_opencv = K^{-1} * [u, v, 1]^T * d
         K_inv = torch.inverse(intrinsics)  # (B, 3, 3)
         # (B, 3, 3) @ (3, N) -> (B, 3, N)
         rays = K_inv @ pixel_coords.unsqueeze(0).expand(B, -1, -1)
-        points_cam = rays * depth_flat.unsqueeze(1)  # (B, 3, N)
+        points_cam_opencv = rays * depth_flat.unsqueeze(1)  # (B, 3, N)
 
-        # Transform to world frame.  extrinsics is world-to-camera, so we
-        # need its inverse (camera-to-world).
-        cam_to_world = torch.inverse(extrinsics)  # (B, 4, 4)
-        R = cam_to_world[:, :3, :3]  # (B, 3, 3)
-        t = cam_to_world[:, :3, 3:]  # (B, 3, 1)
-        points_world = R @ points_cam + t  # (B, 3, N)
+        # Step 3: Convert OpenCV axes → MuJoCo/OpenGL axes
+        # OpenCV:  X right, Y down,  Z forward
+        # MuJoCo:  X right, Y up,    Z backward
+        # Transform: [x, -y, -z]
+        points_cam_mujoco = points_cam_opencv.clone()
+        points_cam_mujoco[:, 1, :] = -points_cam_opencv[:, 1, :]  # flip Y
+        points_cam_mujoco[:, 2, :] = -points_cam_opencv[:, 2, :]  # flip Z
+
+        # Step 4: Transform to world frame using cam_xmat and cam_pos
+        # E[:3,:3] = R_cam_to_world (cam_xmat), E[:3,3] = cam_pos
+        R_cam_to_world = extrinsics[:, :3, :3]  # (B, 3, 3)
+        cam_pos = extrinsics[:, :3, 3:]          # (B, 3, 1)
+        points_world = R_cam_to_world @ points_cam_mujoco + cam_pos  # (B, 3, N)
         points_world = points_world.permute(0, 2, 1)  # (B, N, 3)
 
         # Per-point colours: (B, 3, H, W) -> (B, N, 3)
@@ -221,7 +244,7 @@ class VoxelGrid:
             depth: ``(B, 1, H, W)`` depth in metres.
             rgb: ``(B, 3, H, W)`` colour in ``[0, 1]``.
             intrinsics: ``(B, 3, 3)`` camera intrinsics.
-            extrinsics: ``(B, 4, 4)`` world-to-camera transforms.
+            extrinsics: ``(B, 4, 4)`` cam-to-world ``[R_cam_to_world | cam_pos]``.
 
         Returns:
             ``(B, 4, G, G, G)`` voxel grid with R, G, B, occupancy channels.
@@ -305,7 +328,7 @@ class VoxelEncoder(nn.Module):
             depth: ``(B, 1, H, W)`` depth in metres.
             rgb: ``(B, 3, H, W)`` colour in ``[0, 1]``.
             intrinsics: ``(B, 3, 3)`` camera intrinsics.
-            extrinsics: ``(B, 4, 4)`` world-to-camera transforms.
+            extrinsics: ``(B, 4, 4)`` cam-to-world ``[R_cam_to_world | cam_pos]``.
 
         Returns:
             ``(B, num_tokens, hidden_dim)`` token tensor.  With default
