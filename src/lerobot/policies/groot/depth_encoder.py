@@ -10,11 +10,14 @@ Architecture:
     depth (1ch, meters) 
     → Fourier positional encoding per pixel (dim d, e.g. 64)
     → 2-layer Conv2d CNN (d → 1152, stride=14 overall to match patch_size)
-    → zero-initialized 1×1 conv gate (1152 → 1152)
-    → element-wise sum with RGB patch embeddings
+    → 1×1 conv gate (1152 → 1152, Kaiming init)
+    → depth_proj linear (1152 → 1536, zero-init) ← ensures zero output at init
+    → concatenate with Eagle VL tokens
 
-The zero-init gate ensures that at initialization, the depth branch contributes
-nothing, preserving pretrained RGB performance and enabling smooth learning.
+The zero-init is on depth_proj (not the gate), ensuring the depth branch
+contributes nothing at initialization while keeping gradients flowing.
+Gate has Kaiming init so depth_proj.weight receives non-zero gradients
+from step 1, allowing it to escape zero immediately.
 """
 
 import math
@@ -109,8 +112,9 @@ class DepthPatchEmbedding(nn.Module):
         Layer 1: 7×7 conv, stride 2  → 2× reduction + spatial context
         Layer 2: 7×7 conv, stride 7  → 7× reduction (total: 2×7 = 14 = patch_size)
 
-    After the CNN, a zero-initialized 1×1 conv (linear projection) gates the output
-    so the depth branch starts contributing nothing and smoothly learns.
+    After the CNN, a 1×1 conv (linear projection) with Kaiming init acts as a gate.
+    The actual zero-init for safe residual behavior is applied at depth_proj
+    in groot_n1.py, not here.
 
     Args:
         fourier_dim: Input channels (from Fourier encoding).
@@ -143,11 +147,12 @@ class DepthPatchEmbedding(nn.Module):
             nn.Conv2d(hidden_dim, embed_dim, kernel_size=7, stride=7, padding=0),
         )
 
-        # Zero-initialized gate: 1×1 conv (acts per-patch)
-        # Initialized to zero so depth branch contributes nothing at start.
+        # Gate: 1×1 conv (acts per-patch)
+        # Kaiming-initialized by reset_parameters(). The zero-init residual
+        # pattern is applied at depth_proj (in groot_n1.py), not here.
         # NOTE: HuggingFace's from_pretrained may use meta-device / no_init_weights
         # which can defeat any initialization done in __init__. The authoritative
-        # zero-init is done via zero_init_gate() called after model construction.
+        # init is done via reset_parameters() called after model construction.
         self.gate = nn.Conv2d(embed_dim, embed_dim, kernel_size=1, stride=1, padding=0)
 
     def forward(self, fourier_depth: torch.Tensor) -> torch.Tensor:
@@ -179,10 +184,11 @@ class DepthPatchEmbedding(nn.Module):
 
 
 class DepthBranchEncoder(nn.Module):
-    """Complete depth branch: Fourier encoding → CNN → zero-init gate.
+    """Complete depth branch: Fourier encoding → CNN → gate (Kaiming init).
 
     This is the top-level module that combines FourierPositionalEncoding
     and DepthPatchEmbedding into a single depth processing branch.
+    The zero-init for safe residual behavior is on depth_proj (in groot_n1.py).
 
     Args:
         fourier_dim: Dimension of the Fourier positional encoding (default 64).
@@ -243,9 +249,17 @@ class DepthBranchEncoder(nn.Module):
                     bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
                     torch.nn.init.uniform_(module.bias, -bound, bound)
 
-        # --- Gate: zero-init so depth contributes nothing at start ---
-        self.patch_embedding.gate.weight.data.zero_()
-        self.patch_embedding.gate.bias.data.zero_()
+        # --- Gate: Kaiming init (same as Conv2d default) ---
+        # The gate is NOT zero-initialized here. Instead, depth_proj (in groot_n1.py)
+        # is zero-initialized to ensure the depth branch contributes nothing at init.
+        # Keeping the gate non-zero means depth_proj.weight receives non-zero gradients
+        # from step 1 (because gate_out ≠ 0), allowing it to escape zero immediately.
+        gate = self.patch_embedding.gate
+        torch.nn.init.kaiming_uniform_(gate.weight, a=math.sqrt(5))
+        if gate.bias is not None:
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(gate.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            torch.nn.init.uniform_(gate.bias, -bound, bound)
 
         gate_norm = self.patch_embedding.gate.weight.data.norm().item()
         cnn_norm = sum(
@@ -255,20 +269,21 @@ class DepthBranchEncoder(nn.Module):
         )
         print(
             f"[GROOT] Depth branch reset_parameters: "
-            f"CNN weight norm={cnn_norm:.4f}, gate weight norm={gate_norm}"
+            f"CNN weight norm={cnn_norm:.4f}, gate weight norm={gate_norm:.4f}"
         )
 
     def zero_init_gate(self):
+        assert False, "This method is deprecated. The gate is now Kaiming-initialized by reset_parameters(), and the zero-init residual pattern is applied at depth_proj instead. This method is kept for backward compatibility but should not be called in new code."
         """Zero-initialize the gate weights and biases.
 
-        Must be called AFTER from_pretrained / model construction completes,
-        because HuggingFace's from_pretrained uses meta-device / no_init_weights
-        contexts that can defeat any initialization done inside __init__.
+        DEPRECATED: Gate is now Kaiming-initialized (not zero) by reset_parameters().
+        The zero-init residual pattern is applied at depth_proj instead.
+        Kept for backward compatibility but should not be called in new code.
         """
         self.patch_embedding.gate.weight.data.zero_()
         self.patch_embedding.gate.bias.data.zero_()
         gate_norm = self.patch_embedding.gate.weight.data.norm().item()
-        print(f"[GROOT] Depth gate zero-initialized (weight norm: {gate_norm})")
+        print(f"[GROOT] WARNING: Depth gate zero-initialized (weight norm: {gate_norm}) — this is deprecated")
 
     def forward(self, depth: torch.Tensor) -> torch.Tensor:
         """

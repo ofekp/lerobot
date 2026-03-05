@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,7 +78,7 @@ class EagleBackbone(nn.Module):
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
-            use_depth: whether to use a separate depth branch (Fourier + CNN + zero-init gate)
+            use_depth: whether to use a separate depth branch (Fourier + CNN + gate + zero-init depth_proj)
             depth_fourier_dim: Fourier positional encoding dimension for depth (default 64).
             depth_hidden_dim: Hidden channels in the depth CNN branch (default 256).
             depth_min_freq: Minimum Fourier frequency (default 1.0).
@@ -157,7 +158,7 @@ class EagleBackbone(nn.Module):
             print("[GROOT] Cannot register depth gradient hook: depth branch not available.")
             return
 
-        # Monitor the zero-init gate weights (most informative for learning progress)
+        # Monitor the gate weights (informative for learning progress)
         gate = self.depth_branch.patch_embedding.gate
 
         def hook(grad):
@@ -165,6 +166,11 @@ class EagleBackbone(nn.Module):
                 # Gate weight gradient and value
                 gate_weight_norm = gate.weight.data.norm().item()
                 gate_grad_norm = grad.norm().item()
+                # depth_proj weight and gradient
+                dp_weight_norm = self.depth_proj.weight.data.norm().item()
+                dp_bias_norm = self.depth_proj.bias.data.norm().item()
+                dp_weight_grad = self.depth_proj.weight.grad.norm().item() if self.depth_proj.weight.grad is not None else 0.0
+                dp_bias_grad = self.depth_proj.bias.grad.norm().item() if self.depth_proj.bias.grad is not None else 0.0
                 # CNN weights (first layer)
                 cnn_first = self.depth_branch.patch_embedding.cnn[0]
                 cnn_weight_norm = cnn_first.weight.data.norm().item()
@@ -174,6 +180,10 @@ class EagleBackbone(nn.Module):
                     f"[Depth Branch Monitor @ step {self._depth_grad_step_counter}] "
                     f"Gate weight norm: {gate_weight_norm:.6f}, "
                     f"Gate grad norm: {gate_grad_norm:.6f}, "
+                    f"depth_proj weight norm: {dp_weight_norm:.6f}, "
+                    f"depth_proj bias norm: {dp_bias_norm:.6f}, "
+                    f"depth_proj weight grad: {dp_weight_grad:.6f}, "
+                    f"depth_proj bias grad: {dp_bias_grad:.6f}, "
                     f"CNN[0] weight norm: {cnn_weight_norm:.6f}, "
                     f"Fourier freq range: [{freq_vals.min().item():.2f}, {freq_vals.max().item():.2f}]",
                     flush=True,
@@ -613,17 +623,17 @@ class GR00TN15(PreTrainedModel):
             # For eval flow (LeRobot checkpoint), these weights will be overwritten
             # when the checkpoint is loaded later.
             pretrained_model.backbone.depth_branch.reset_parameters()
-            # Zero-init depth_proj so depth tokens start as TRUE zeros.
-            # The depth_branch gate is zero-init → its output is zeros, but
-            # nn.Linear.reset_parameters() gives a non-zero bias, so
-            # depth_proj(zeros) = bias ≈ 0.03 → 256 non-zero constant tokens
-            # that disrupt pretrained attention patterns after LayerNorm.
-            # By zero-initing weight AND bias, depth tokens are exactly zero
-            # at init and gradually "turn on" as the depth branch learns.
+            # Zero-init depth_proj (both weight AND bias).
+            # The gate has Kaiming init → gate_out ≠ 0 during forward pass.
+            # depth_proj(gate_out) = 0·gate_out + 0 = 0 → safe init (no perturbation).
+            # Gradient for depth_proj.weight: dL/dW = dL/dy · gate_out^T ≠ 0
+            #   (because gate_out ≠ 0) → depth_proj escapes zero on step 1.
+            # After step 1, depth_proj.W ≠ 0, so gradients flow back through
+            #   it to the gate and CNN: dL/d(gate_out) = W^T · dL/dy ≠ 0.
             pretrained_model.backbone.depth_proj.weight.data.zero_()
             pretrained_model.backbone.depth_proj.bias.data.zero_()
-            print(f"[GROOT] depth_proj zero-initialized (weight norm: "
-                  f"{pretrained_model.backbone.depth_proj.weight.data.norm().item()}, "
+            print(f"[GROOT] depth_proj initialized (weight norm: "
+                  f"{pretrained_model.backbone.depth_proj.weight.data.norm().item():.4f}, "
                   f"bias norm: {pretrained_model.backbone.depth_proj.bias.data.norm().item()})")
 
             pretrained_model.backbone.register_depth_gradient_hook(log_every_n_steps=1000)
