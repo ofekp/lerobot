@@ -839,12 +839,12 @@ def _normalize_depth_for_fusion(
 class GrootEagleCollateStep(ProcessorStep):
     tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO
     # Depth normalization parameters for late fusion
-    # Set depth_scale based on your depth units: 1/1000 for mm, 1/10 for m (to get ~[0,1] range)
-    depth_scale: float = 0.001  # Default assumes depth in mm, converts to meters
-    depth_mean: float = 0.5  # Center depth around 0 after scaling
-    depth_std: float = 0.5   # Scale to roughly match RGB normalized range
-    # Directory for saving diagnostic observation mosaic (from CLI --output_dir)
-    debug_dir: str = None
+    # NOTE: LeRobot's dataset loader (hf_transform_to_torch) already converts
+    # depth from uint16 mm to float32 meters, so data arrives here in meters.
+    # Use scale=1.0, mean=0.0, std=1.0 (pass-through) to preserve metric depth.
+    depth_scale: float = 1.0   # Data is already in meters from dataset loader
+    depth_mean: float = 0.0    # No centering — keep metric values
+    depth_std: float = 1.0     # No rescaling — keep metric values
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
     _saved_mosaic: bool = field(default=False, init=False, repr=False)
 
