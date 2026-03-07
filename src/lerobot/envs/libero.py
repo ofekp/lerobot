@@ -283,13 +283,10 @@ class LiberoEnv(gym.Env):
         
         # If depth is enabled, visualize it side-by-side with RGB
         if self.use_depth and "depths" in formatted_obs:
-            # Get depth for the same camera as the main image
-            # Assuming "image" key exists, look for corresponding depth
-            depth_key = None
-            for cam_name in self.camera_name:
-                if self.camera_name_mapping.get(cam_name) == "image":
-                    depth_key = self.camera_name_mapping.get(cam_name.replace("_image", "_depth"))
-                    break
+            # Derive the depth key from the first camera (same one used for the RGB image above)
+            first_cam = self.camera_name[0]
+            depth_cam = first_cam.replace("_image", "_depth")
+            depth_key = self.camera_name_mapping.get(depth_cam)
             if depth_key and depth_key in formatted_obs["depths"]:
                 depth = formatted_obs["depths"][depth_key]
                 depth = depth[::-1, ::-1]  # flip to match image orientation
