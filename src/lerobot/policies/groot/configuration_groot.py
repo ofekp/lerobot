@@ -65,15 +65,16 @@ class GrootConfig(PreTrainedConfig):
 
     # Depth normalization parameters for late fusion (after Eagle RGB processing)
     # Raw depth values are transformed as: (depth * depth_scale - depth_mean) / depth_std
-    # This should produce values in a similar range to ImageNet-normalized RGB (~[-2, 2])
+    # NOTE: LeRobot's dataset loader already converts uint16 mm → float32 meters,
+    # so data arrives here in meters. Default is pass-through (no extra transform).
     # 
     # Example configurations:
-    # - Depth in mm, max ~10m:   depth_scale=0.0001, depth_mean=0.5, depth_std=0.5 → range ~[-1, 1]
-    # - Depth in meters, max 10m: depth_scale=0.1, depth_mean=0.5, depth_std=0.5 → range ~[-1, 1]
-    # - Raw depth (no scaling):   depth_scale=1.0, depth_mean=0.0, depth_std=1.0 → keep original values
-    depth_scale: float = 0.001    # Scale factor (default: mm to meters)
-    depth_mean: float = 0.5       # Mean for centering
-    depth_std: float = 0.5        # Std for scaling
+    # - Pass-through (data in m):  depth_scale=1.0, depth_mean=0.0, depth_std=1.0 → keep meter values
+    # - Centered (data in m):      depth_scale=1.0, depth_mean=2.0, depth_std=1.0 → center around typical indoor depth
+    # - Depth in raw mm:           depth_scale=0.001, depth_mean=0.5, depth_std=0.5 → convert & normalize
+    depth_scale: float = 1.0     # Data is already in meters from dataset loader
+    depth_mean: float = 0.0      # No centering by default
+    depth_std: float = 1.0       # No rescaling by default
 
     # ViT layer indices to tap for FastGuide guidance (0-indexed)
     # Default: 4 evenly-spaced layers in a 24-layer SigLIP ViT
