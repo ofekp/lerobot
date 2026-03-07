@@ -151,9 +151,9 @@ def make_groot_pre_post_processors(
         # 5. Collate eagle_content -> eagle_* tensors, then concatenate depth with RGB pixel_values
         GrootEagleCollateStep(
             tokenizer_assets_repo=config.tokenizer_assets_repo,
-            depth_scale=getattr(config, 'depth_scale', 0.001),
-            depth_mean=getattr(config, 'depth_mean', 0.5),
-            depth_std=getattr(config, 'depth_std', 0.5),
+            depth_scale=getattr(config, 'depth_scale', 1.0),
+            depth_mean=getattr(config, 'depth_mean', 0.0),
+            depth_std=getattr(config, 'depth_std', 1.0),
         ),
         # 6. Move to device
         DeviceProcessorStep(device=config.device),
