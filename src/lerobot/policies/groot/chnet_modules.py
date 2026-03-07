@@ -211,13 +211,22 @@ class DepthCrossAttentionFusion(nn.Module):
         """
         Args:
             eagle_features: (B, seq_len, hidden_dim) from Eagle model
-            depth_features: (B, C, H, W) from DepthCNNEncoder
+            depth_features: (N, C, H, W) from DepthCNNEncoder, where N = B * num_views
         Returns:
             (B, seq_len, hidden_dim) enriched features
         """
-        b, c, h, w = depth_features.shape
-        depth_tokens = depth_features.flatten(2).transpose(1, 2)  # (B, H*W, C)
-        depth_tokens = self.depth_proj(depth_tokens)  # (B, H*W, hidden_dim)
+        n, c, h, w = depth_features.shape
+        b_eagle = eagle_features.shape[0]
+        depth_tokens = depth_features.flatten(2).transpose(1, 2)  # (N, H*W, C)
+        depth_tokens = self.depth_proj(depth_tokens)  # (N, H*W, hidden_dim)
+
+        # Handle multi-view: when using multiple cameras, depth has N = B * num_views
+        # entries but eagle_features has only B. Merge view tokens so batch dims match.
+        if n != b_eagle:
+            num_views = n // b_eagle
+            tokens_per_view = depth_tokens.shape[1]
+            # (B*V, T, D) -> (B, V*T, D) — each batch element attends to all its views
+            depth_tokens = depth_tokens.view(b_eagle, num_views * tokens_per_view, -1)
 
         # Cross-attention: Q=eagle, K=depth, V=depth
         attn_out, _ = self.cross_attn(
