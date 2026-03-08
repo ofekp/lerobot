@@ -149,42 +149,6 @@ def knn(x: torch.Tensor, k: int) -> torch.Tensor:
 # ------------------------------------------------------------------
 
 
-def farthest_point_sampling(xyz: torch.Tensor, num_samples: int) -> torch.Tensor:
-    """Iterative farthest point sampling.
-
-    Greedily selects ``num_samples`` points from each batch element such that
-    each new point is the one farthest from the already-selected set.
-
-    Args:
-        xyz: ``(B, N, 3)`` point coordinates.
-        num_samples: Number of points to sample.
-
-    Returns:
-        idx: ``(B, num_samples)`` indices of selected points.
-    """
-    B, N, _ = xyz.shape
-    device = xyz.device
-
-    idx = torch.zeros(B, num_samples, dtype=torch.long, device=device)
-    # Distance from each point to the nearest selected point (initialised to inf)
-    distances = torch.full((B, N), float("inf"), device=device)
-
-    # Start from a random point per batch element
-    farthest = torch.randint(0, N, (B,), device=device)
-
-    for i in range(num_samples):
-        idx[:, i] = farthest
-        # (B, 1, 3) — the newly selected point
-        centroid = xyz[torch.arange(B, device=device), farthest, :].unsqueeze(1)
-        # (B, N) — distance from every point to the new centroid
-        dist = torch.sum((xyz - centroid) ** 2, dim=-1)
-        # Update: keep the *minimum* distance to any selected point so far
-        distances = torch.min(distances, dist)
-        # Next point is the one with the largest minimum distance
-        farthest = distances.argmax(dim=-1)
-
-    return idx
-
 
 # ------------------------------------------------------------------
 # EdgeConv — Dynamic Graph Convolution Block
@@ -284,6 +248,7 @@ class DGCNNEncoder(nn.Module):
             (-1.5, 1.5),
             (1.0, 3.5),
         ),
+        camera_weights: str | None = None,
     ) -> None:
         super().__init__()
         self.num_points = num_points
@@ -291,6 +256,20 @@ class DGCNNEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_tokens = num_tokens
         self.workspace_bounds = workspace_bounds
+
+        # Parse camera weights: "front:30,wrist:70" -> {"front": 0.3, "wrist": 0.7}
+        self.camera_weight_map: dict[str, float] | None = None
+        if camera_weights is not None:
+            parsed = {}
+            for entry in camera_weights.split(","):
+                name, pct = entry.strip().split(":")
+                parsed[name.strip()] = float(pct.strip())
+            total = sum(parsed.values())
+            if abs(total - 100.0) > 0.01:
+                raise ValueError(
+                    f"dgcnn_camera_weights must sum to 100, got {total}: {camera_weights}"
+                )
+            self.camera_weight_map = {k: v / 100.0 for k, v in parsed.items()}
 
         # Register workspace bounds as a buffer so they travel with the model
         # (device / dtype transfers, state_dict, etc.)
@@ -315,6 +294,7 @@ class DGCNNEncoder(nn.Module):
         depth: torch.Tensor,
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
+        camera_names: list[str] | None = None,
     ) -> torch.Tensor:
         """Encode depth observations into a token sequence.
 
@@ -327,32 +307,66 @@ class DGCNNEncoder(nn.Module):
             intrinsics: ``(B, V, 3, 3)`` or ``(B, 3, 3)`` camera intrinsics.
             extrinsics: ``(B, V, 4, 4)`` or ``(B, 4, 4)`` camera-to-world
                 transforms (``[R_cam_to_world | cam_pos]``).
+            camera_names: list of camera names matching the view dimension,
+                used for per-camera weighted sampling when ``camera_weights``
+                was specified at init.
 
         Returns:
             ``(B, num_tokens, hidden_dim)`` token tensor.
         """
         # ----------------------------------------------------------
-        # 1. Back-project depth to world-frame points
+        # 1. Back-project depth to world-frame points, track view origin
         # ----------------------------------------------------------
         if depth.dim() == 5:
             # Multi-view: (B, V, 1, H, W)
             B, V = depth.shape[:2]
             all_points = []
             all_masks = []
+            all_view_ids = []
             for v in range(V):
-                pts, mask = backproject(
+                pts, msk = backproject(
                     depth[:, v],          # (B, 1, H, W)
                     intrinsics[:, v],     # (B, 3, 3)
                     extrinsics[:, v],     # (B, 4, 4)
                 )
                 all_points.append(pts)   # (B, N_v, 3)
-                all_masks.append(mask)   # (B, N_v)
-            points = torch.cat(all_points, dim=1)  # (B, N_total, 3)
-            valid = torch.cat(all_masks, dim=1)     # (B, N_total)
+                all_masks.append(msk)    # (B, N_v)
+                # Tag each point with its view index
+                all_view_ids.append(torch.full(
+                    (B, pts.shape[1]), v, device=pts.device, dtype=torch.long,
+                ))
+            points = torch.cat(all_points, dim=1)      # (B, N_total, 3)
+            valid = torch.cat(all_masks, dim=1)          # (B, N_total)
+            view_ids = torch.cat(all_view_ids, dim=1)    # (B, N_total)
         else:
             # Single-view: (B, 1, H, W)
             B = depth.shape[0]
+            V = 1
             points, valid = backproject(depth, intrinsics, extrinsics)
+            view_ids = torch.zeros(B, points.shape[1], device=points.device, dtype=torch.long)
+
+        # Validate camera_weights covers all depth cameras
+        if self.camera_weight_map is not None:
+            if camera_names is None:
+                raise ValueError(
+                    "dgcnn_camera_weights is set but camera_names was not passed to forward()"
+                )
+            if len(camera_names) != V:
+                raise ValueError(
+                    f"camera_names length ({len(camera_names)}) != number of views ({V})"
+                )
+            missing = set(camera_names) - set(self.camera_weight_map)
+            if missing:
+                raise ValueError(
+                    f"Depth cameras {missing} not listed in dgcnn_camera_weights. "
+                    f"Every depth camera must be specified. Got: {self.camera_weight_map}"
+                )
+            extra = set(self.camera_weight_map) - set(camera_names)
+            if extra:
+                raise ValueError(
+                    f"dgcnn_camera_weights lists cameras {extra} not found in depth data. "
+                    f"Depth cameras in dataset: {camera_names}"
+                )
 
         # ----------------------------------------------------------
         # 2. Filter to workspace bounds
@@ -379,30 +393,27 @@ class DGCNNEncoder(nn.Module):
             B, self.num_points, 3, device=points.device, dtype=points.dtype,
         )
 
-        for b in range(B):
-            valid_idx = mask[b].nonzero(as_tuple=False).squeeze(-1)  # (M,)
-            M = valid_idx.shape[0]
+        # Build per-point sampling weights (uniform or camera-weighted)
+        if self.camera_weight_map is not None and camera_names is not None:
+            weight_per_view = torch.tensor(
+                [self.camera_weight_map[c] for c in camera_names],
+                device=points.device, dtype=points.dtype,
+            )  # (V,)
+            point_weights = weight_per_view[view_ids]  # (B, N)
+            point_weights = point_weights * mask.float()  # zero out invalid
+        else:
+            point_weights = mask.float()  # (B, N) — uniform over valid points
 
-            if M == 0:
-                # No valid points — fill with zeros (degenerate case)
+        for b in range(B):
+            w = point_weights[b]
+            if w.sum() == 0:
                 logger.warning(
                     "DGCNNEncoder: no valid points in batch element %d "
                     "(all depth invalid or outside workspace)", b,
                 )
                 continue
-            elif M >= self.num_points:
-                # Enough points — use FPS for uniform coverage
-                valid_pts = points[b, valid_idx]  # (M, 3)
-                with torch.no_grad():
-                    fps_idx = farthest_point_sampling(
-                        valid_pts.unsqueeze(0), self.num_points,
-                    )  # (1, num_points)
-                sampled_points[b] = valid_pts[fps_idx[0]]
-            else:
-                # Too few points — take all, then oversample with replacement
-                valid_pts = points[b, valid_idx]  # (M, 3)
-                pad_idx = torch.randint(0, M, (self.num_points - M,), device=points.device)
-                sampled_points[b] = torch.cat([valid_pts, valid_pts[pad_idx]], dim=0)
+            idx = torch.multinomial(w, self.num_points, replacement=True)
+            sampled_points[b] = points[b, idx]
 
         # ----------------------------------------------------------
         # 4. DGCNN layers — four EdgeConv blocks
@@ -418,12 +429,12 @@ class DGCNNEncoder(nn.Module):
         assert features.abs().sum() > 0, "EdgeConv features are all zeros"
 
         # ----------------------------------------------------------
-        # 5. Pool to num_tokens via FPS on spatial coordinates
+        # 5. Pool to num_tokens via random sampling on spatial coordinates
         # ----------------------------------------------------------
-        with torch.no_grad():
-            seed_idx = farthest_point_sampling(
-                sampled_points, self.num_tokens,
-            )  # (B, num_tokens)
+        seed_idx = torch.stack([
+            torch.randperm(self.num_points, device=features.device)[:self.num_tokens]
+            for _ in range(B)
+        ])  # (B, num_tokens)
 
         # Gather features at seed indices
         seed_idx_expanded = seed_idx.unsqueeze(-1).expand(

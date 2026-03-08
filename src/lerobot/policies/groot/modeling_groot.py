@@ -86,6 +86,7 @@ class GrootPolicy(PreTrainedPolicy):
         print(f"  dgcnn_num_points={self.config.dgcnn_num_points}")
         print(f"  dgcnn_k={self.config.dgcnn_k}")
         print(f"  dgcnn_num_tokens={self.config.dgcnn_num_tokens}")
+        print(f"  dgcnn_camera_weights={self.config.dgcnn_camera_weights}")
 
         model = GR00TN15.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -98,6 +99,7 @@ class GrootPolicy(PreTrainedPolicy):
             dgcnn_num_points=self.config.dgcnn_num_points,
             dgcnn_k=self.config.dgcnn_k,
             dgcnn_num_tokens=self.config.dgcnn_num_tokens,
+            dgcnn_camera_weights=self.config.dgcnn_camera_weights,
         )
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype

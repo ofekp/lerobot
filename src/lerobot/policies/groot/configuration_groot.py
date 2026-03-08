@@ -66,6 +66,10 @@ class GrootConfig(PreTrainedConfig):
     dgcnn_num_points: int = 2048   # points sampled from depth
     dgcnn_k: int = 20              # k-NN neighbors for EdgeConv
     dgcnn_num_tokens: int = 64     # output tokens for action head
+    # Per-camera point sampling weights, e.g. "front:30,wrist:70".
+    # Every depth camera must be listed, percentages must sum to 100.
+    # If None, uniform random sampling across all cameras.
+    dgcnn_camera_weights: str | None = None
 
     # Groot-specific model parameters (from groot_finetune_script.py)
 

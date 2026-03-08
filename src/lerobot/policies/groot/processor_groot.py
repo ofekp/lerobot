@@ -635,6 +635,7 @@ class GrootDgcnnPrepStep(ProcessorStep):
         depth_tensors = []
         intrinsics_tensors = []
         extrinsics_tensors = []
+        camera_names = []
 
         for dk in depth_keys:
             d = obs[dk]
@@ -666,6 +667,7 @@ class GrootDgcnnPrepStep(ProcessorStep):
             elif d.dim() == 3:  # (B, H, W) or (1, H, W)
                 d = d.unsqueeze(1)
             depth_tensors.append(d.to(torch.float32))
+            camera_names.append(cam_name)
 
             # Normalize intrinsics to (B, 3, 3)
             if isinstance(intr, torch.Tensor):
@@ -700,6 +702,7 @@ class GrootDgcnnPrepStep(ProcessorStep):
         comp["dgcnn_depth"] = dgcnn_depth
         comp["dgcnn_intrinsics"] = dgcnn_intrinsics
         comp["dgcnn_extrinsics"] = dgcnn_extrinsics
+        comp["dgcnn_camera_names"] = camera_names
 
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp

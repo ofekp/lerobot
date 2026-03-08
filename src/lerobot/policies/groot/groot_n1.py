@@ -71,6 +71,7 @@ class EagleBackbone(nn.Module):
         dgcnn_num_points: int = 2048,
         dgcnn_k: int = 20,
         dgcnn_num_tokens: int = 64,
+        dgcnn_camera_weights: str | None = None,
     ):
         """
         Args:
@@ -126,6 +127,7 @@ class EagleBackbone(nn.Module):
                 hidden_dim=project_to_dim if project_to_dim is not None else 2048,
                 num_tokens=dgcnn_num_tokens,
                 workspace_bounds=dgcnn_workspace_bounds,
+                camera_weights=dgcnn_camera_weights,
             )
             print(f"[GROOT] DGCNNEncoder initialized: points={dgcnn_num_points}, k={dgcnn_k}, "
                   f"tokens={self.point_cloud_encoder.num_tokens}, "
@@ -206,10 +208,12 @@ class EagleBackbone(nn.Module):
             pc_depth = vl_input.get("dgcnn_depth")
             pc_intrinsics = vl_input.get("dgcnn_intrinsics")
             pc_extrinsics = vl_input.get("dgcnn_extrinsics")
+            pc_camera_names = vl_input.get("dgcnn_camera_names")
 
             if all(v is not None for v in [pc_depth, pc_intrinsics, pc_extrinsics]):
                 pc_tokens = self.point_cloud_encoder(
                     pc_depth, pc_intrinsics, pc_extrinsics,
+                    camera_names=pc_camera_names,
                 )
                 pc_tokens = pc_tokens.to(dtype=eagle_embeds.dtype, device=eagle_embeds.device)
 
@@ -435,6 +439,7 @@ class GR00TN15(PreTrainedModel):
         dgcnn_num_points = kwargs.pop("dgcnn_num_points", 2048)
         dgcnn_k = kwargs.pop("dgcnn_k", 20)
         dgcnn_num_tokens = kwargs.pop("dgcnn_num_tokens", 64)
+        dgcnn_camera_weights = kwargs.pop("dgcnn_camera_weights", None)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
@@ -484,6 +489,7 @@ class GR00TN15(PreTrainedModel):
                 config_dict["backbone_cfg"]["dgcnn_num_points"] = dgcnn_num_points
                 config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
                 config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
+                config_dict["backbone_cfg"]["dgcnn_camera_weights"] = dgcnn_camera_weights
 
             config = cls.config_class(**config_dict)
             pretrained_model = cls(config, local_model_path=local_model_path)
@@ -504,6 +510,7 @@ class GR00TN15(PreTrainedModel):
                     config_dict["backbone_cfg"]["dgcnn_num_points"] = dgcnn_num_points
                     config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
                     config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
+                    config_dict["backbone_cfg"]["dgcnn_camera_weights"] = dgcnn_camera_weights
 
                 config = cls.config_class(**config_dict)
                 kwargs["config"] = config
