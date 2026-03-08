@@ -74,6 +74,17 @@ class GrootConfig(PreTrainedConfig):
     depth_mean: float = 0.5       # Mean for centering
     depth_std: float = 0.5        # Std for scaling
 
+    # Point cloud encoder settings (DGCNN for 3D spatial reasoning)
+    use_voxel: bool = False  # enables point cloud encoder (kept for CLI compat)
+    voxel_workspace_bounds: tuple[tuple[float, float], ...] = (
+        (-0.3, 0.3),   # x: left-right
+        (-0.3, 0.3),   # y: forward-back
+        (0.6, 1.0),    # z: table surface to above
+    )
+    dgcnn_num_points: int = 2048   # points sampled from depth
+    dgcnn_k: int = 20              # k-NN neighbors for EdgeConv
+    dgcnn_num_tokens: int = 64     # output tokens for action head
+
     # Groot-specific model parameters (from groot_finetune_script.py)
 
     # Path or HuggingFace model ID for the base Groot model

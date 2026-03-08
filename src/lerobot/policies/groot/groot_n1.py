@@ -47,6 +47,7 @@ from lerobot.policies.groot.action_head.flow_matching_action_head import (
     FlowmatchingActionHeadConfig,
 )
 from lerobot.policies.groot.utils import ensure_eagle_cache_ready
+from lerobot.policies.groot.voxel_encoder import DGCNNEncoder
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_model").resolve())
@@ -68,6 +69,11 @@ class EagleBackbone(nn.Module):
         use_depth: bool = False,
         depth_weight_init: str = "rgb_average",
         _skip_depth_init: bool = False,
+        use_voxel: bool = False,
+        voxel_workspace_bounds: tuple = ((-0.3, 0.3), (-0.3, 0.3), (0.6, 1.0)),
+        dgcnn_num_points: int = 2048,
+        dgcnn_k: int = 20,
+        dgcnn_num_tokens: int = 64,
     ):
         """
         Args:
@@ -99,6 +105,21 @@ class EagleBackbone(nn.Module):
             print(f"[GROOT] Warning: failed to prepare Eagle cache for backbone: {exc}")
 
         config = AutoConfig.from_pretrained(str(cache_dir), trust_remote_code=True)
+
+        # Auto-detect attention backend: flash_attention_2 needs Ampere+ (SM ≥ 8.0)
+        import torch as _torch
+        _attn_impl = "flash_attention_2"
+        if _torch.cuda.is_available():
+            major, _ = _torch.cuda.get_device_capability()
+            if major < 8:
+                _attn_impl = "sdpa"
+                print(f"[GROOT] GPU SM {major}.x < 8.0 — using sdpa attention (flash_attention_2 requires Ampere+)")
+        config._attn_implementation = _attn_impl
+        if hasattr(config, "text_config"):
+            config.text_config._attn_implementation = _attn_impl
+        if hasattr(config, "vision_config"):
+            config.vision_config._attn_implementation = _attn_impl
+
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
         # Depth extension strategy:
@@ -113,6 +134,21 @@ class EagleBackbone(nn.Module):
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
         else:
             self.eagle_linear = torch.nn.Identity()
+
+        # DGCNN point cloud encoder for 3D spatial tokens
+        self.use_voxel = use_voxel
+        self.point_cloud_encoder = None
+        if self.use_voxel:
+            self.point_cloud_encoder = DGCNNEncoder(
+                num_points=dgcnn_num_points,
+                k=dgcnn_k,
+                hidden_dim=project_to_dim if project_to_dim is not None else 2048,
+                num_tokens=dgcnn_num_tokens,
+                workspace_bounds=voxel_workspace_bounds,
+            )
+            print(f"[GROOT] DGCNNEncoder initialized: points={dgcnn_num_points}, k={dgcnn_k}, "
+                  f"tokens={self.point_cloud_encoder.num_tokens}, "
+                  f"params={sum(p.numel() for p in self.point_cloud_encoder.parameters()):,}")
 
         # needed since we don't use these layers. Also saves compute
         while len(self.eagle_model.language_model.model.layers) > select_layer:
@@ -404,8 +440,7 @@ class EagleBackbone(nn.Module):
 
         eagle_embeds, eagle_mask = self.forward_eagle(vl_input)
 
-        # YL (TODO HACK): to resolve DDP issue when tune_visual=True
-        # Ensure all trainable parameters in vision_model are used in the forward pass for DDP compatibility
+        # DDP compatibility hack for tune_visual
         if self.training and self.tune_visual:
             dummy_term = torch.tensor(
                 0.0, device=eagle_embeds.device, dtype=eagle_embeds.dtype, requires_grad=True
@@ -415,9 +450,50 @@ class EagleBackbone(nn.Module):
                     dummy_term = dummy_term + 0.0 * param.sum()
             eagle_embeds = eagle_embeds + dummy_term
 
+        # DGCNN point cloud encoder: concat 3D spatial tokens with Eagle tokens
+        if self.use_voxel and self.point_cloud_encoder is not None:
+            pc_depth = vl_input.get("voxel_depth")
+            pc_intrinsics = vl_input.get("voxel_intrinsics")
+            pc_extrinsics = vl_input.get("voxel_extrinsics")
+
+            if all(v is not None for v in [pc_depth, pc_intrinsics, pc_extrinsics]):
+                pc_tokens = self.point_cloud_encoder(
+                    pc_depth, pc_intrinsics, pc_extrinsics,
+                )
+                pc_tokens = pc_tokens.to(dtype=eagle_embeds.dtype, device=eagle_embeds.device)
+
+                # --- DGCNN verification assertions ---
+                assert pc_tokens.abs().sum() > 0, (
+                    "DGCNN tokens are all zeros — depth encoder is not producing useful features"
+                )
+                assert pc_tokens.shape[1:] == (self.point_cloud_encoder.num_tokens, eagle_embeds.shape[-1]), (
+                    f"DGCNN token shape mismatch: got {pc_tokens.shape}, "
+                    f"expected (B, {self.point_cloud_encoder.num_tokens}, {eagle_embeds.shape[-1]})"
+                )
+
+                n_eagle = eagle_embeds.shape[1]
+                eagle_embeds = torch.cat([eagle_embeds, pc_tokens], dim=1)
+
+                assert eagle_embeds.shape[1] == n_eagle + pc_tokens.shape[1], (
+                    f"DGCNN tokens not aggregated: {eagle_embeds.shape[1]} != {n_eagle} + {pc_tokens.shape[1]}"
+                )
+
+                pc_mask = torch.ones(
+                    pc_tokens.shape[0], pc_tokens.shape[1],
+                    dtype=eagle_mask.dtype, device=eagle_mask.device,
+                )
+                eagle_mask = torch.cat([eagle_mask, pc_mask], dim=1)
+            else:
+                import warnings
+                warnings.warn(
+                    "use_voxel=True but voxel_depth/intrinsics/extrinsics missing from input — "
+                    "DGCNN is configured but NOT being used this forward pass",
+                    RuntimeWarning, stacklevel=2,
+                )
+
         return BatchFeature(
             data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
-        )  # [B, T2, hidden_size]
+        )
 
 
 BACKBONE_FEATURE_KEY = "backbone_features"
@@ -611,6 +687,15 @@ class GR00TN15(PreTrainedModel):
         use_depth = kwargs.pop("use_depth", False)
         depth_weight_init = kwargs.pop("depth_weight_init", "rgb_average")
 
+        # DGCNN point cloud encoder settings
+        use_voxel = kwargs.pop("use_voxel", False)
+        voxel_workspace_bounds = kwargs.pop("voxel_workspace_bounds", ((-0.3, 0.3), (-0.3, 0.3), (0.6, 1.0)))
+        dgcnn_num_points = kwargs.pop("dgcnn_num_points", 2048)
+        dgcnn_k = kwargs.pop("dgcnn_k", 20)
+        dgcnn_num_tokens = kwargs.pop("dgcnn_num_tokens", 64)
+
+        print(f"Use point cloud encoder (DGCNN): {use_voxel}")
+
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
@@ -692,9 +777,16 @@ class GR00TN15(PreTrainedModel):
                 config_dict["backbone_cfg"]["use_depth"] = use_depth
                 config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
                 config_dict["backbone_cfg"]["_skip_depth_init"] = False  # Extend in __init__
-            
+
+            if use_voxel and "backbone_cfg" in config_dict:
+                config_dict["backbone_cfg"]["use_voxel"] = use_voxel
+                config_dict["backbone_cfg"]["voxel_workspace_bounds"] = voxel_workspace_bounds
+                config_dict["backbone_cfg"]["dgcnn_num_points"] = dgcnn_num_points
+                config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
+                config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
+
             config = cls.config_class(**config_dict)
-            
+
             # Create model with correct architecture (4-ch if depth)
             # Don't load weights here - load_model_as_safetensor will handle it
             pretrained_model = cls(config, local_model_path=local_model_path)
@@ -709,20 +801,27 @@ class GR00TN15(PreTrainedModel):
             # Need to load 3-ch weights first, then extend to 4-ch with rgb_average
             print("[GROOT] Detected HuggingFace checkpoint format (training flow)")
             
-            if use_depth:
+            if use_depth or use_voxel:
                 import json
                 config_path = Path(local_model_path) / "config.json"
                 with open(config_path, "r") as f:
                     config_dict = json.load(f)
-                
+
                 if "backbone_cfg" in config_dict:
-                    config_dict["backbone_cfg"]["use_depth"] = use_depth
-                    config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
-                    config_dict["backbone_cfg"]["_skip_depth_init"] = True  # Don't extend in __init__
-                
+                    if use_depth:
+                        config_dict["backbone_cfg"]["use_depth"] = use_depth
+                        config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
+                        config_dict["backbone_cfg"]["_skip_depth_init"] = True  # Don't extend in __init__
+                    if use_voxel:
+                        config_dict["backbone_cfg"]["use_voxel"] = use_voxel
+                        config_dict["backbone_cfg"]["voxel_workspace_bounds"] = voxel_workspace_bounds
+                        config_dict["backbone_cfg"]["dgcnn_num_points"] = dgcnn_num_points
+                        config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
+                        config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
+
                 config = cls.config_class(**config_dict)
                 kwargs["config"] = config
-            
+
             # Use HuggingFace's from_pretrained to load base model weights
             pretrained_model = super().from_pretrained(
                 local_model_path, local_model_path=local_model_path, **kwargs

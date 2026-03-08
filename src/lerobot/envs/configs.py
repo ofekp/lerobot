@@ -271,6 +271,8 @@ class LiberoEnv(EnvConfig):
     observation_width: int = 360
     # Depth support for RGB-D evaluation
     use_depth: bool = False
+    # Voxel encoder support (PerAct-inspired 3D spatial tokens)
+    use_voxel: bool = False
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),

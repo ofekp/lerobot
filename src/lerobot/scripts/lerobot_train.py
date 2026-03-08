@@ -529,6 +529,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
+            # Save voxel grid visualization if voxel encoder is active
+            _unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+            _groot_model = getattr(_unwrapped, "_groot_model", None)
+            _voxel_enc = getattr(getattr(_groot_model, "backbone", None), "point_cloud_encoder", None) if _groot_model else None
+            if _voxel_enc is not None and hasattr(_voxel_enc, "_last_point_cloud"):
+                try:
+                    from lerobot.policies.groot.voxel_encoder import render_point_cloud_projections
+                    from PIL import Image
+                    viz_dir = Path(cfg.output_dir) / "voxel_viz"
+                    viz_dir.mkdir(parents=True, exist_ok=True)
+                    img_arr = render_point_cloud_projections(_voxel_enc._last_point_cloud)
+                    Image.fromarray(img_arr).save(viz_dir / f"step_{step:06d}.png")
+                except Exception as viz_exc:
+                    logging.warning(f"Voxel visualization failed at step {step}: {viz_exc}")
+
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")

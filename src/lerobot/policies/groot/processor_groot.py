@@ -155,9 +155,14 @@ def make_groot_pre_post_processors(
             depth_mean=getattr(config, 'depth_mean', 0.5),
             depth_std=getattr(config, 'depth_std', 0.5),
         ),
-        # 6. Move to device
-        DeviceProcessorStep(device=config.device),
     ]
+
+    # 6. Add voxel prep step if enabled
+    if getattr(config, 'use_voxel', False):
+        input_steps.append(GrootVoxelPrepStep())
+
+    # 7. Move to device (always last)
+    input_steps.append(DeviceProcessorStep(device=config.device))
 
     # Postprocessing: slice to env action dim and unnormalize to env scale, then move to CPU
     output_steps: list[ProcessorStep] = [
@@ -852,6 +857,72 @@ class GrootEagleCollateStep(ProcessorStep):
         obs.pop(
             "video", None
         )  # The video has been fully encoded into eagle_* tensors, so we don't need the raw video anymore
+        transition[TransitionKey.OBSERVATION] = obs
+        transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+        return transition
+
+    def transform_features(self, features):
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="groot_voxel_prep_v1")
+class GrootVoxelPrepStep(ProcessorStep):
+    """Prepare DGCNN encoder inputs from depth and camera params.
+
+    Extracts depth, intrinsics, and extrinsics from observations
+    and stores them as voxel_* keys in complementary data for the
+    EagleBackbone to pass to DGCNNEncoder.  RGB is NOT used — the
+    DGCNN operates on XYZ point clouds only.
+    """
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
+        comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+
+        intrinsics = obs.get("observation.camera_intrinsics")
+        extrinsics = obs.get("observation.camera_extrinsics")
+
+        if intrinsics is None or extrinsics is None:
+            transition[TransitionKey.OBSERVATION] = obs
+            transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+            return transition
+
+        # Get depth from depth_raw (set by GrootPackInputsStep)
+        depth_raw = obs.get("depth_raw")
+        if depth_raw is None:
+            transition[TransitionKey.OBSERVATION] = obs
+            transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+            return transition
+
+        # depth_raw: (B, T, V, 1, H, W) — take first timestep, keep views
+        B, T, V, C, H, W = depth_raw.shape
+        voxel_depth = depth_raw[:, 0, :, :, :, :]  # (B, V, 1, H, W)
+        voxel_depth = voxel_depth.to(torch.float32)
+        # Convert mm to meters if needed
+        if voxel_depth.max() > 100:
+            voxel_depth = voxel_depth / 1000.0
+
+        # Ensure camera params have batch and view dims: (B, V, 3, 3) and (B, V, 4, 4)
+        if isinstance(intrinsics, torch.Tensor):
+            if intrinsics.dim() == 2:  # (3, 3) -> (B, 1, 3, 3)
+                intrinsics = intrinsics.unsqueeze(0).unsqueeze(0).expand(B, V, -1, -1)
+            elif intrinsics.dim() == 3 and intrinsics.shape[0] == B:  # (B, 3, 3) -> (B, 1, 3, 3)
+                intrinsics = intrinsics.unsqueeze(1).expand(-1, V, -1, -1)
+        if isinstance(extrinsics, torch.Tensor):
+            if extrinsics.dim() == 2:  # (4, 4) -> (B, 1, 4, 4)
+                extrinsics = extrinsics.unsqueeze(0).unsqueeze(0).expand(B, V, -1, -1)
+            elif extrinsics.dim() == 3 and extrinsics.shape[0] == B:  # (B, 4, 4) -> (B, 1, 4, 4)
+                extrinsics = extrinsics.unsqueeze(1).expand(-1, V, -1, -1)
+
+        assert voxel_depth.abs().sum() > 0, (
+            "voxel_depth is all zeros — depth data not loaded correctly from dataset"
+        )
+
+        comp["voxel_depth"] = voxel_depth
+        comp["voxel_intrinsics"] = intrinsics.to(torch.float32) if isinstance(intrinsics, torch.Tensor) else intrinsics
+        comp["voxel_extrinsics"] = extrinsics.to(torch.float32) if isinstance(extrinsics, torch.Tensor) else extrinsics
+
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
         return transition
