@@ -119,17 +119,24 @@ class EagleBackbone(nn.Module):
             self.eagle_linear = torch.nn.Identity()
 
         hidden_dim = 2048  # eagle_linear input dim
-        # Derive vit_dim from actual model config instead of hardcoding
-        vit_dim = getattr(config.vision_config, 'hidden_size', 1152)
-        self.chnet = CHNetDepthProcessor(
-            vit_dim=vit_dim,
-            hidden_dim=hidden_dim,
-            channels=tuple(chnet_channels),
-        )
+
+        # CHNet depth processing (only when depth is enabled)
         self._chnet_tap_layers = tuple(chnet_tap_layers)
         self._vit_hook_features = {}
-        self._register_vit_hooks()
-        print(f"[GROOT] CHNet depth processor initialized (vit_dim={vit_dim}, hidden_dim={hidden_dim}, tapping ViT layers {chnet_tap_layers})")
+        self._vit_hooks = []
+        if self.use_depth:
+            # Derive vit_dim from actual model config instead of hardcoding
+            vit_dim = getattr(config.vision_config, 'hidden_size', 1152)
+            self.chnet = CHNetDepthProcessor(
+                vit_dim=vit_dim,
+                hidden_dim=hidden_dim,
+                channels=tuple(chnet_channels),
+            )
+            self._register_vit_hooks()
+            print(f"[GROOT] CHNet depth processor initialized (vit_dim={vit_dim}, hidden_dim={hidden_dim}, tapping ViT layers {chnet_tap_layers})")
+        else:
+            self.chnet = None
+            print("[GROOT] CHNet disabled (use_depth=False)")
 
         # needed since we don't use these layers. Also saves compute
         while len(self.eagle_model.language_model.model.layers) > select_layer:
@@ -216,6 +223,7 @@ class EagleBackbone(nn.Module):
         If the loaded weights already have 4 channels (i.e., checkpoint was trained with depth),
         this method will skip the extension to preserve the trained depth weights.
         """
+        assert False, "For CHNET we do not use the 4-channel extension strategy such as in the modality-augmented paper"
         if self._depth_extended:
             print("[GROOT] Patch embedding already extended for depth, skipping.")
             return
@@ -258,6 +266,7 @@ class EagleBackbone(nn.Module):
         - Initialize depth-channel weights using RGB kernel averaging:
           W_patch(D) = 1/3 * (W_patch(R) + W_patch(G) + W_patch(B))
         """
+        assert False, "For CHNET we do not use the 4-channel extension strategy such as in the modality-augmented paper"
         vision_model = self.eagle_model.vision_model
         
         # Find the patch embedding layer - it's typically in the embeddings
@@ -377,11 +386,11 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
-        #Ofek please double check me here, I think I just cancelled training the DiT
-        for name, p in self.named_parameters():
-            if 'chnet' in name:
-                p.requires_grad = True
-        print(f"[GROOT] CHNet modules set to trainable")
+        # CHNet modules live on self.chnet (not under eagle_model), so they are
+        # unaffected by the LLM/ViT freezing above. Explicitly ensure trainability.
+        if self.chnet is not None:
+            self.chnet.requires_grad_(True)
+            print("[GROOT] CHNet modules set to trainable")
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -442,6 +451,24 @@ class EagleBackbone(nn.Module):
 
         del eagle_input["image_sizes"]
 
+        # Verify depth is flowing through when expected
+        if not hasattr(self, '_depth_fwd_count'):
+            self._depth_fwd_count = 0
+        if self.use_depth:
+            if depth_normalized is None:
+                raise RuntimeError(
+                    f"[GROOT] use_depth=True but depth_normalized is None! "
+                    f"Depth data is not reaching the model. Check processor/dataset. "
+                    f"(forward call #{self._depth_fwd_count})"
+                )
+            self._depth_fwd_count += 1
+            if self._depth_fwd_count <= 3 or self._depth_fwd_count % 5000 == 0:
+                mode = "TRAIN" if self.training else "EVAL"
+                print(f"[GROOT DEPTH OK] [{mode}] fwd #{self._depth_fwd_count}: "
+                      f"depth shape={depth_normalized.shape}, "
+                      f"range=[{depth_normalized.min().item():.4f}, {depth_normalized.max().item():.4f}]",
+                      flush=True)
+
         # Clear hook features before forward
         self._vit_hook_features.clear()
 
@@ -469,6 +496,7 @@ class EagleBackbone(nn.Module):
                     depth_normalized, size=(224, 224), mode='nearest'
                 )
 
+            eagle_features_before = eagle_features
             eagle_features = self.chnet(
                 depth=depth_normalized,
                 vit_features=vit_feats,
@@ -476,6 +504,32 @@ class EagleBackbone(nn.Module):
                 grid_w=grid_w,
                 eagle_features=eagle_features,
             )
+
+            # Verify CHNet actually modified the features meaningfully
+            diff = (eagle_features - eagle_features_before).abs()
+            diff_norm = diff.norm().item()
+            all_zero = eagle_features.abs().max().item() == 0.0
+            unchanged = diff_norm == 0.0
+
+            if all_zero:
+                raise RuntimeError(
+                    "[GROOT] CHNet output is all zeros! Cross-attention fusion produced empty features."
+                )
+            if unchanged:
+                raise RuntimeError(
+                    "[GROOT] CHNet did not change eagle_features at all! "
+                    "Cross-attention residual is zero — depth signal is not being fused."
+                )
+
+            if self._depth_fwd_count <= 3 or self._depth_fwd_count % 5000 == 0:
+                mode = "TRAIN" if self.training else "EVAL"
+                ratio = diff_norm / eagle_features_before.norm().item()
+                print(f"[GROOT CHNet VERIFY] [{mode}] fwd #{self._depth_fwd_count}: "
+                      f"diff_norm={diff_norm:.4f}, "
+                      f"before_norm={eagle_features_before.norm().item():.4f}, "
+                      f"after_norm={eagle_features.norm().item():.4f}, "
+                      f"change_ratio={ratio:.6f}",
+                      flush=True)
 
         eagle_features = self.eagle_linear(eagle_features)
         return eagle_features, eagle_input["attention_mask"]
@@ -773,8 +827,12 @@ class GR00TN15(PreTrainedModel):
             with open(config_path, "r") as f:
                 config_dict = json.load(f)
             
-            # Inject depth settings 
+            # Inject depth settings into backbone_cfg so EagleBackbone
+            # is constructed with the correct architecture for the checkpoint.
             if use_depth and "backbone_cfg" in config_dict:
+                config_dict["backbone_cfg"]["use_depth"] = True
+                config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
+                config_dict["backbone_cfg"]["_skip_depth_init"] = not checkpoint_has_4_channels
                 config_dict["backbone_cfg"]["chnet_tap_layers"] = chnet_tap_layers
                 config_dict["backbone_cfg"]["chnet_channels"] = chnet_channels
             
