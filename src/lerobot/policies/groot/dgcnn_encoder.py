@@ -2,9 +2,13 @@
 
 Provides:
   - ``backproject()``: back-projects depth images into world-frame 3D point
-    clouds (pure tensor ops, no learnable parameters).
+    clouds (pure tensor ops, no learnable parameters).  Handles the vertical
+    flip (OpenGL framebuffer origin) and OpenCV→MuJoCo axis conversion.
   - ``DGCNNEncoder``: processes point clouds with Dynamic Graph CNN to produce
     a flat sequence of tokens suitable for transformer consumption.
+
+Extrinsics convention: camera-to-world ``[R_cam_to_world | cam_pos]`` where
+``R_cam_to_world`` is MuJoCo ``cam_xmat`` and ``cam_pos`` is ``cam_xpos``.
 
 The DGCNN architecture follows Wang et al. "Dynamic Graph CNN for Learning on
 Point Clouds" (2019), using iterative EdgeConv layers with dynamic k-NN graph
@@ -36,14 +40,24 @@ def backproject(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unproject depth pixels into world-frame 3D points.
 
-    Applies ``K^{-1} * [u, v, 1]^T * d`` to obtain camera-frame points, then
-    transforms them to the world frame via the inverse of the extrinsics
-    (world-to-camera) matrix.
+    The depth images stored in the dataset (and rendered at eval time) are in
+    OpenGL framebuffer order (origin at bottom-left), which is vertically
+    flipped relative to the top-left convention assumed by the intrinsics K.
+    This function:
+
+    1. Flips the depth vertically so pixel coords match K.
+    2. Back-projects via ``K^{-1} * [u, v, 1]^T * d`` → OpenCV camera frame.
+    3. Converts OpenCV axes (X right, Y down, Z forward) to MuJoCo/OpenGL
+       axes (X right, Y up, Z backward): ``[x, -y, -z]``.
+    4. Transforms to world frame using the extrinsics, which are stored as
+       ``[R_cam_to_world | cam_pos]`` (camera-to-world, MuJoCo convention).
 
     Args:
         depth: ``(B, 1, H, W)`` depth map in metres.
         intrinsics: ``(B, 3, 3)`` camera intrinsic matrices.
-        extrinsics: ``(B, 4, 4)`` world-to-camera rigid transforms.
+        extrinsics: ``(B, 4, 4)`` camera-to-world transforms where
+            ``E[:3, :3]`` is ``R_cam_to_world`` (MuJoCo ``cam_xmat``) and
+            ``E[:3, 3]`` is ``cam_pos`` (MuJoCo ``cam_xpos``).
 
     Returns:
         points_world: ``(B, N, 3)`` 3D points in world frame where ``N = H * W``.
@@ -52,6 +66,10 @@ def backproject(
     """
     B, _, H, W = depth.shape
     device = depth.device
+
+    # Step 1: Flip depth vertically so pixel (0,0) = top-left, matching K.
+    # The stored depth is in OpenGL framebuffer order (origin bottom-left).
+    depth = torch.flip(depth, dims=[-2])
 
     # Build pixel coordinate grid  --  (H, W) each
     v_coords, u_coords = torch.meshgrid(
@@ -71,19 +89,26 @@ def backproject(
     # Depth per pixel: (B, N)
     depth_flat = depth.reshape(B, -1)  # (B, N)
 
-    # Camera-frame 3D points: p_cam = K^{-1} * [u, v, 1]^T * d
+    # Step 2: Back-project → OpenCV camera frame
+    # p_cam_opencv = K^{-1} * [u, v, 1]^T * d
     # Cast to float32 for inverse (linalg.inv doesn't support bf16/fp16)
     K_inv = torch.inverse(intrinsics.float())  # (B, 3, 3)
     # (B, 3, 3) @ (3, N) -> (B, 3, N)
     rays = K_inv @ pixel_coords.unsqueeze(0).expand(B, -1, -1)
-    points_cam = rays * depth_flat.float().unsqueeze(1)  # (B, 3, N)
+    points_cam = rays * depth_flat.float().unsqueeze(1)  # (B, 3, N)  — OpenCV axes
 
-    # Transform to world frame.  extrinsics is world-to-camera, so we
-    # need its inverse (camera-to-world).
-    cam_to_world = torch.inverse(extrinsics.float())  # (B, 4, 4)
-    R = cam_to_world[:, :3, :3]  # (B, 3, 3)
-    t = cam_to_world[:, :3, 3:]  # (B, 3, 1)
-    points_world = R @ points_cam + t  # (B, 3, N)
+    # Step 3-4: Convert OpenCV axes → MuJoCo axes: [x, -y, -z]
+    # OpenCV: X right, Y down, Z forward
+    # MuJoCo/OpenGL: X right, Y up, Z backward
+    points_cam[:, 1, :] = -points_cam[:, 1, :]
+    points_cam[:, 2, :] = -points_cam[:, 2, :]
+
+    # Step 5: Camera-to-world using extrinsics directly.
+    # E = [R_cam_to_world | cam_pos], so:
+    #   points_world = R_cam_to_world @ points_cam_mujoco + cam_pos
+    R = extrinsics[:, :3, :3].float()   # R_cam_to_world  (B, 3, 3)
+    t = extrinsics[:, :3, 3:].float()   # cam_pos          (B, 3, 1)
+    points_world = R @ points_cam + t   # (B, 3, N)
     points_world = points_world.permute(0, 2, 1)  # (B, N, 3)
 
     # Validity mask: reject depth values outside [0.01, 10.0] metres
@@ -300,8 +325,8 @@ class DGCNNEncoder(nn.Module):
             depth: ``(B, V, 1, H, W)`` multi-view or ``(B, 1, H, W)``
                 single-view depth maps in metres.
             intrinsics: ``(B, V, 3, 3)`` or ``(B, 3, 3)`` camera intrinsics.
-            extrinsics: ``(B, V, 4, 4)`` or ``(B, 4, 4)`` world-to-camera
-                transforms.
+            extrinsics: ``(B, V, 4, 4)`` or ``(B, 4, 4)`` camera-to-world
+                transforms (``[R_cam_to_world | cam_pos]``).
 
         Returns:
             ``(B, num_tokens, hidden_dim)`` token tensor.

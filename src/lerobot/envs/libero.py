@@ -465,13 +465,13 @@ class LiberoEnv(gym.Env):
             ], dtype=np.float32)
 
             # Extrinsics (per-frame, handles dynamic cameras)
+            # Store as [R_cam_to_world | cam_pos] to match training format
+            # from replay.py's get_camera_params().
             cam_pos = sim.data.cam_xpos[cam_id].copy()
-            cam_rot = sim.data.cam_xmat[cam_id].reshape(3, 3).copy()
-            R_wc = cam_rot.T
-            t_wc = -R_wc @ cam_pos
+            R_cam_to_world = sim.data.cam_xmat[cam_id].reshape(3, 3).copy()
             extrinsics = np.eye(4, dtype=np.float32)
-            extrinsics[:3, :3] = R_wc
-            extrinsics[:3, 3] = t_wc
+            extrinsics[:3, :3] = R_cam_to_world
+            extrinsics[:3, 3] = cam_pos
 
             obs["camera_intrinsics"] = intrinsics
             obs["camera_extrinsics"] = extrinsics
