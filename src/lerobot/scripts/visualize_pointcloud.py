@@ -24,9 +24,9 @@ from lerobot.policies.groot.dgcnn_encoder import backproject
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKSPACE_BOUNDS = (
-    (-0.3, 0.3),
-    (-0.3, 0.3),
-    (0.6, 1.0),
+    (-0.5, 4.5),
+    (-1.5, 1.5),
+    (1.0, 3.5),
 )
 
 
@@ -45,11 +45,16 @@ def load_frame(dataset_path: str, episode: int, frame: int) -> dict:
             f"Episode {episode} out of range (dataset has {len(ep_starts)} episodes)"
         )
 
-    abs_idx = ep_starts[episode].item() + frame
-    if abs_idx >= ep_ends[episode].item():
+    start = ep_starts[episode]
+    end = ep_ends[episode]
+    start = start.item() if hasattr(start, "item") else int(start)
+    end = end.item() if hasattr(end, "item") else int(end)
+
+    abs_idx = start + frame
+    if abs_idx >= end:
         raise ValueError(
             f"Frame {frame} out of range for episode {episode} "
-            f"(episode has {ep_ends[episode].item() - ep_starts[episode].item()} frames)"
+            f"(episode has {end - start} frames)"
         )
 
     return ds[abs_idx]
@@ -75,10 +80,18 @@ def extract_cameras(sample: dict) -> list[dict]:
         cam_name = ".".join(parts[img_idx + 1 : -1])  # handle nested names
 
         # Look for corresponding intrinsics and extrinsics
-        intrinsics_key = f"observation.images.{cam_name}.intrinsics"
-        extrinsics_key = f"observation.images.{cam_name}.extrinsics"
+        # They may be under observation.images.{name}.* or observation.camera.{name}.*
+        intrinsics_key = None
+        extrinsics_key = None
+        for prefix in [f"observation.images.{cam_name}", f"observation.camera.{cam_name}"]:
+            ik = f"{prefix}.intrinsics"
+            ek = f"{prefix}.extrinsics"
+            if ik in sample and ek in sample:
+                intrinsics_key = ik
+                extrinsics_key = ek
+                break
 
-        if intrinsics_key not in sample or extrinsics_key not in sample:
+        if intrinsics_key is None or extrinsics_key is None:
             logger.warning(
                 "Skipping camera %s: missing intrinsics or extrinsics", cam_name
             )

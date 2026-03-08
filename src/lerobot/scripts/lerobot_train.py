@@ -535,6 +535,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             _dgcnn_enc = getattr(getattr(_groot_model, "backbone", None), "point_cloud_encoder", None) if _groot_model else None
             if _dgcnn_enc is not None and hasattr(_dgcnn_enc, "_last_point_cloud"):
                 try:
+                    from pathlib import Path
                     from lerobot.policies.groot.dgcnn_encoder import render_point_cloud_projections
                     from PIL import Image
                     viz_dir = Path(cfg.output_dir) / "dgcnn_viz"

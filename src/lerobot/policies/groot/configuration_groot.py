@@ -59,9 +59,9 @@ class GrootConfig(PreTrainedConfig):
     use_depth: bool = False
 
     dgcnn_workspace_bounds: tuple[tuple[float, float], ...] = (
-        (-0.3, 0.3),   # x: left-right
-        (-0.3, 0.3),   # y: forward-back
-        (0.6, 1.0),    # z: table surface to above
+        (-0.5, 4.5),   # x
+        (-1.5, 1.5),   # y
+        (1.0, 3.5),    # z
     )
     dgcnn_num_points: int = 2048   # points sampled from depth
     dgcnn_k: int = 20              # k-NN neighbors for EdgeConv

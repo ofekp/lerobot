@@ -72,14 +72,15 @@ def backproject(
     depth_flat = depth.reshape(B, -1)  # (B, N)
 
     # Camera-frame 3D points: p_cam = K^{-1} * [u, v, 1]^T * d
-    K_inv = torch.inverse(intrinsics)  # (B, 3, 3)
+    # Cast to float32 for inverse (linalg.inv doesn't support bf16/fp16)
+    K_inv = torch.inverse(intrinsics.float())  # (B, 3, 3)
     # (B, 3, 3) @ (3, N) -> (B, 3, N)
     rays = K_inv @ pixel_coords.unsqueeze(0).expand(B, -1, -1)
-    points_cam = rays * depth_flat.unsqueeze(1)  # (B, 3, N)
+    points_cam = rays * depth_flat.float().unsqueeze(1)  # (B, 3, N)
 
     # Transform to world frame.  extrinsics is world-to-camera, so we
     # need its inverse (camera-to-world).
-    cam_to_world = torch.inverse(extrinsics)  # (B, 4, 4)
+    cam_to_world = torch.inverse(extrinsics.float())  # (B, 4, 4)
     R = cam_to_world[:, :3, :3]  # (B, 3, 3)
     t = cam_to_world[:, :3, 3:]  # (B, 3, 1)
     points_world = R @ points_cam + t  # (B, 3, N)
@@ -254,9 +255,9 @@ class DGCNNEncoder(nn.Module):
         hidden_dim: int = 1536,
         num_tokens: int = 64,
         workspace_bounds: tuple[tuple[float, float], ...] = (
-            (-0.3, 0.3),
-            (-0.3, 0.3),
-            (0.6, 1.0),
+            (-0.5, 4.5),
+            (-1.5, 1.5),
+            (1.0, 3.5),
         ),
     ) -> None:
         super().__init__()
@@ -433,9 +434,9 @@ class DGCNNEncoder(nn.Module):
 def render_point_cloud_projections(
     points: torch.Tensor,
     workspace_bounds: tuple[tuple[float, float], ...] = (
-        (-0.3, 0.3),
-        (-0.3, 0.3),
-        (0.6, 1.0),
+        (-0.5, 4.5),
+        (-1.5, 1.5),
+        (1.0, 3.5),
     ),
     scale: int = 4,
 ) -> np.ndarray:

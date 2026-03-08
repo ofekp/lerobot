@@ -622,63 +622,84 @@ class GrootDgcnnPrepStep(ProcessorStep):
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
 
-        intrinsics = obs.get("observation.camera_intrinsics")
-        extrinsics = obs.get("observation.camera_extrinsics")
-
-        if intrinsics is None or extrinsics is None:
-            transition[TransitionKey.OBSERVATION] = obs
-            transition[TransitionKey.COMPLEMENTARY_DATA] = comp
-            return transition
-
-        # Extract depth tensors directly from observation keys
+        # Extract depth tensors from observation keys
         depth_keys = sorted([k for k in obs if k.startswith("observation.images.") and "depth" in k.lower()])
         if not depth_keys:
             transition[TransitionKey.OBSERVATION] = obs
             transition[TransitionKey.COMPLEMENTARY_DATA] = comp
             return transition
 
+        # For each depth key, find corresponding intrinsics/extrinsics
+        # Depth: observation.images.{cam}.depth
+        # Camera params: observation.camera.{cam}.intrinsics or observation.images.{cam}.intrinsics
         depth_tensors = []
+        intrinsics_tensors = []
+        extrinsics_tensors = []
+
         for dk in depth_keys:
             d = obs[dk]
-            if isinstance(d, torch.Tensor):
-                if d.dim() == 2:  # (H, W)
-                    d = d.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-                elif d.dim() == 3:  # (B, H, W)
-                    d = d.unsqueeze(1)  # (B, 1, H, W)
-                depth_tensors.append(d.to(torch.float32))
+            if not isinstance(d, torch.Tensor):
+                continue
 
-        if not depth_tensors:
+            # Extract camera name: "observation.images.front.depth" -> "front"
+            parts = dk.split(".")
+            img_idx = parts.index("images")
+            cam_name = ".".join(parts[img_idx + 1 : -1])
+
+            # Find intrinsics/extrinsics under observation.camera.{cam} or observation.images.{cam}
+            intr = None
+            extr = None
+            for prefix in [f"observation.camera.{cam_name}", f"observation.images.{cam_name}"]:
+                ik = f"{prefix}.intrinsics"
+                ek = f"{prefix}.extrinsics"
+                if ik in obs and ek in obs:
+                    intr = obs[ik]
+                    extr = obs[ek]
+                    break
+
+            if intr is None or extr is None:
+                continue
+
+            # Normalize depth shape to (B, 1, H, W)
+            if d.dim() == 2:  # (H, W)
+                d = d.unsqueeze(0).unsqueeze(0)
+            elif d.dim() == 3:  # (B, H, W) or (1, H, W)
+                d = d.unsqueeze(1)
+            depth_tensors.append(d.to(torch.float32))
+
+            # Normalize intrinsics to (B, 3, 3)
+            if isinstance(intr, torch.Tensor):
+                if intr.dim() == 2:
+                    intr = intr.unsqueeze(0)
+                intrinsics_tensors.append(intr.to(torch.float32))
+
+            # Normalize extrinsics to (B, 4, 4)
+            if isinstance(extr, torch.Tensor):
+                if extr.dim() == 2:
+                    extr = extr.unsqueeze(0)
+                extrinsics_tensors.append(extr.to(torch.float32))
+
+        if not depth_tensors or len(depth_tensors) != len(intrinsics_tensors):
             transition[TransitionKey.OBSERVATION] = obs
             transition[TransitionKey.COMPLEMENTARY_DATA] = comp
             return transition
 
-        # Stack depth tensors: (B, V, 1, H, W)
-        dgcnn_depth = torch.stack(depth_tensors, dim=1)  # (B, V, 1, H, W)
-        B, V = dgcnn_depth.shape[:2]
+        # Stack across views: (B, V, 1, H, W), (B, V, 3, 3), (B, V, 4, 4)
+        dgcnn_depth = torch.stack(depth_tensors, dim=1)
+        dgcnn_intrinsics = torch.stack(intrinsics_tensors, dim=1)
+        dgcnn_extrinsics = torch.stack(extrinsics_tensors, dim=1)
 
         # Convert mm to meters if needed
         if dgcnn_depth.max() > 100:
             dgcnn_depth = dgcnn_depth / 1000.0
-
-        # Ensure camera params have batch and view dims: (B, V, 3, 3) and (B, V, 4, 4)
-        if isinstance(intrinsics, torch.Tensor):
-            if intrinsics.dim() == 2:  # (3, 3) -> (B, 1, 3, 3)
-                intrinsics = intrinsics.unsqueeze(0).unsqueeze(0).expand(B, V, -1, -1)
-            elif intrinsics.dim() == 3 and intrinsics.shape[0] == B:  # (B, 3, 3) -> (B, 1, 3, 3)
-                intrinsics = intrinsics.unsqueeze(1).expand(-1, V, -1, -1)
-        if isinstance(extrinsics, torch.Tensor):
-            if extrinsics.dim() == 2:  # (4, 4) -> (B, 1, 4, 4)
-                extrinsics = extrinsics.unsqueeze(0).unsqueeze(0).expand(B, V, -1, -1)
-            elif extrinsics.dim() == 3 and extrinsics.shape[0] == B:  # (B, 4, 4) -> (B, 1, 4, 4)
-                extrinsics = extrinsics.unsqueeze(1).expand(-1, V, -1, -1)
 
         assert dgcnn_depth.abs().sum() > 0, (
             "dgcnn_depth is all zeros — depth data not loaded correctly from dataset"
         )
 
         comp["dgcnn_depth"] = dgcnn_depth
-        comp["dgcnn_intrinsics"] = intrinsics.to(torch.float32) if isinstance(intrinsics, torch.Tensor) else intrinsics
-        comp["dgcnn_extrinsics"] = extrinsics.to(torch.float32) if isinstance(extrinsics, torch.Tensor) else extrinsics
+        comp["dgcnn_intrinsics"] = dgcnn_intrinsics
+        comp["dgcnn_extrinsics"] = dgcnn_extrinsics
 
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp

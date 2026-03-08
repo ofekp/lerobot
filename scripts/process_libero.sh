@@ -82,11 +82,7 @@ SEED=142
 EVAL_N_EPISODES=50
 EVAL_BATCH_SIZE=10
 
-# Depth settings (for RGBD mode) — identity transform, depth stays in meters
-DEPTH_WEIGHT_INIT="rgb_average"
-DEPTH_SCALE=1.0
-DEPTH_MEAN=0.0
-DEPTH_STD=1.0
+# Depth settings — use_depth enables DGCNN point cloud encoder + depth rendering
 
 # ---- Helper: get the eval camera name (LIBERO appends _image) ----
 get_eval_camera_name() {
@@ -294,7 +290,7 @@ run_train() {
 
     local depth_args=""
     if [ "$mode" = "rgbd" ]; then
-        depth_args="--policy.use_depth=true --policy.depth_weight_init=${DEPTH_WEIGHT_INIT} --policy.depth_scale=${DEPTH_SCALE} --policy.depth_mean=${DEPTH_MEAN} --policy.depth_std=${DEPTH_STD}"
+        depth_args="--policy.use_depth=true"
     fi
 
     CUDA_VISIBLE_DEVICES=${gpu} python3 -m lerobot.scripts.lerobot_train \
@@ -341,7 +337,7 @@ run_eval() {
     local camera_mapping
     if [ "$mode" = "rgbd" ]; then
         camera_mapping=$(get_camera_name_mapping_rgbd "${camera}")
-        depth_args="--env.use_depth=true --policy.use_depth=true --policy.depth_scale=${DEPTH_SCALE} --policy.depth_mean=${DEPTH_MEAN} --policy.depth_std=${DEPTH_STD}"
+        depth_args="--env.use_depth=true --policy.use_depth=true"
     else
         camera_mapping=$(get_camera_name_mapping_rgb "${camera}")
     fi
