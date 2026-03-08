@@ -83,7 +83,6 @@ class GrootPolicy(PreTrainedPolicy):
         print(f"  tune_projector={self.config.tune_projector}")
         print(f"  tune_diffusion_model={self.config.tune_diffusion_model}")
         print(f"  use_depth={self.config.use_depth}")
-        print(f"  use_voxel={self.config.use_voxel}")
         print(f"  dgcnn_num_points={self.config.dgcnn_num_points}")
         print(f"  dgcnn_k={self.config.dgcnn_k}")
         print(f"  dgcnn_num_tokens={self.config.dgcnn_num_tokens}")
@@ -95,9 +94,7 @@ class GrootPolicy(PreTrainedPolicy):
             tune_projector=self.config.tune_projector,
             tune_diffusion_model=self.config.tune_diffusion_model,
             use_depth=self.config.use_depth,
-            depth_weight_init=self.config.depth_weight_init,
-            use_voxel=self.config.use_voxel,
-            voxel_workspace_bounds=self.config.voxel_workspace_bounds,
+            dgcnn_workspace_bounds=self.config.dgcnn_workspace_bounds,
             dgcnn_num_points=self.config.dgcnn_num_points,
             dgcnn_k=self.config.dgcnn_k,
             dgcnn_num_tokens=self.config.dgcnn_num_tokens,
@@ -125,7 +122,7 @@ class GrootPolicy(PreTrainedPolicy):
         groot_inputs = {
             k: v
             for k, v in batch.items()
-            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
+            if (k in allowed_base or k.startswith("eagle_") or k.startswith("dgcnn_")) and not (k.startswith("next.") or k == "info")
         }
 
         # Get device from model parameters
@@ -158,7 +155,7 @@ class GrootPolicy(PreTrainedPolicy):
         groot_inputs = {
             k: v
             for k, v in batch.items()
-            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
+            if (k in allowed_base or k.startswith("eagle_") or k.startswith("dgcnn_")) and not (k.startswith("next.") or k == "info")
         }
 
         # Get device from model parameters

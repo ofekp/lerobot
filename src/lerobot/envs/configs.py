@@ -269,10 +269,8 @@ class LiberoEnv(EnvConfig):
     camera_name_mapping: dict[str, str] | None = None
     observation_height: int = 360
     observation_width: int = 360
-    # Depth support for RGB-D evaluation
+    # Depth support (DGCNN point cloud encoder + depth rendering in eval)
     use_depth: bool = False
-    # Voxel encoder support (PerAct-inspired 3D spatial tokens)
-    use_voxel: bool = False
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),

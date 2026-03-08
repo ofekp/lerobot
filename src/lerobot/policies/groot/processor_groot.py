@@ -126,12 +126,10 @@ def make_groot_pre_post_processors(
 
     input_steps: list[ProcessorStep] = [
         # 1. Rename keys if needed (e.g., dataset-specific camera names)
-        # Leave empty for now - add mappings if your dataset uses different key names
         RenameObservationsProcessorStep(rename_map={}),
         # 2. Add batch dimension for single samples
         AddBatchDimensionProcessorStep(),
         # 3. Pack video/state/action/language/embodiment; apply optional min-max normalization before padding
-        # Depth is kept separate from RGB for late fusion
         GrootPackInputsStep(
             state_horizon=state_horizon,
             action_horizon=action_horizon,
@@ -142,24 +140,20 @@ def make_groot_pre_post_processors(
             embodiment_tag=config.embodiment_tag,
             normalize_min_max=True,
             stats=padded_stats,
-            use_depth=getattr(config, 'use_depth', False),
         ),
-        # 4. Eagle encode RGB images (creates eagle_content), depth passes through unchanged
+        # 4. Eagle encode RGB images (creates eagle_content)
         GrootEagleEncodeStep(
             tokenizer_assets_repo=config.tokenizer_assets_repo,
         ),
-        # 5. Collate eagle_content -> eagle_* tensors, then concatenate depth with RGB pixel_values
+        # 5. Collate eagle_content -> eagle_* tensors
         GrootEagleCollateStep(
             tokenizer_assets_repo=config.tokenizer_assets_repo,
-            depth_scale=getattr(config, 'depth_scale', 0.001),
-            depth_mean=getattr(config, 'depth_mean', 0.5),
-            depth_std=getattr(config, 'depth_std', 0.5),
         ),
     ]
 
-    # 6. Add voxel prep step if enabled
-    if getattr(config, 'use_voxel', False):
-        input_steps.append(GrootVoxelPrepStep())
+    # 6. Add DGCNN prep step if depth is enabled
+    if getattr(config, 'use_depth', False):
+        input_steps.append(GrootDgcnnPrepStep())
 
     # 7. Move to device (always last)
     input_steps.append(DeviceProcessorStep(device=config.device))
@@ -197,37 +191,6 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
     if img_t.dtype.is_floating_point:
         img_t = (img_t.clamp(0, 1) * 255.0).to(torch.uint8)
     return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
-
-
-def _prepare_depth_tensor(depth_t: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
-    """Prepare depth tensor for late fusion with RGB.
-    
-    Keeps depth values unnormalized (preserving metric depth information).
-    Only reshapes and resizes to match RGB spatial dimensions.
-    
-    Args:
-        depth_t: Depth tensor of shape (B, 1, H, W) or (B, H, W), any dtype
-        target_h: Target height to match RGB
-        target_w: Target width to match RGB
-        
-    Returns:
-        torch.Tensor of shape (B, 1, H, W) as float32, unnormalized
-    """
-    # Handle different input shapes
-    if depth_t.dim() == 3:  # (B, H, W)
-        depth_t = depth_t.unsqueeze(1)  # (B, 1, H, W)
-    
-    # Convert to float32 if needed (preserve actual values)
-    depth_t = depth_t.to(torch.float32)
-    
-    # Resize if needed to match RGB dimensions
-    b, c, h, w = depth_t.shape
-    if h != target_h or w != target_w:
-        depth_t = torch.nn.functional.interpolate(
-            depth_t, size=(target_h, target_w), mode='nearest'
-        )
-    
-    return depth_t.cpu()
 
 
 def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
@@ -269,8 +232,6 @@ class GrootPackInputsStep(ProcessorStep):
             "unitree_g1": 3,
         }
     )
-    # Depth modality augmentation support (paper: "Modality-Augmented Fine-Tuning")
-    use_depth: bool = False
     # Min-max normalization (SO100-like) applied BEFORE padding
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
@@ -319,41 +280,8 @@ class GrootPackInputsStep(ProcessorStep):
         
         if img_keys:
             cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]  # List of (B, H, W, 3)
-            b, h, w, _ = cams[0].shape  # Get spatial dims from first camera
-            
-            # Handle depth: keep separate for late fusion (after Eagle RGB processing)
-            if self.use_depth:
-                # Find depth images based on the img_keys
-                depth_keys = []
-                found_depth = False
-                # TODO(ofekp): note that this means we do not support depth streams that have no corresponding RGB steam
-                for img_key in img_keys:
-                    if img_key == "observation.image":
-                        assert "observation.image.depth" in obs, "[GROOT] Error: depth_key not found in observations."
-                        depth_keys.append("observation.image.depth")
-                        found_depth = True
-                        break
-                    depth_key = f"{img_key}.depth"
-                    if depth_key in obs:
-                        found_depth = True
-                        depth_keys.append(depth_key)
-                    else:
-                        depth_keys.append(None)  # indicates that this camera stream has no depth
 
-                if not depth_keys or len(depth_keys) == 0:
-                    raise Exception("[GROOT] Warning: use_depth=True but no depth images found. Using RGB only.")
-                
-                # Prepare depth tensors (unnormalized, just resized to match RGB)
-                # TODO(ofekp): take care of the device when torch.zeros is called e.g. device=next(iter(obs.values())).device
-                # import pdb; pdb.set_trace()
-                depth_tensors = [_prepare_depth_tensor(obs[k], h, w) if k is not None else torch.zeros((b, 1, h, w)).cpu() for k in depth_keys]  # List of (B, 1, H, W)
-                
-                # Stack depth tensors: (B, V, 1, H, W) where V = num cameras
-                depth_stacked = torch.stack(depth_tensors, dim=1)  # (B, V, 1, H, W)
-                depth_stacked = depth_stacked.unsqueeze(1)  # (B, 1, V, 1, H, W) to match video T dim
-                obs["depth_raw"] = depth_stacked  # Keep for late fusion
-                    
-            # Create RGB-only video (depth will be concatenated after Eagle processing)
+            # Create RGB-only video
             video = np.stack(cams, axis=1)  # (B, V, H, W, 3)
             video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, 3)
             # Reorder to (B, T, V, C, H, W) - always C=3 for RGB
@@ -362,11 +290,6 @@ class GrootPackInputsStep(ProcessorStep):
             # Drop raw images to avoid confusion downstream
             for k in img_keys:
                 obs.pop(k, None)
-            # Drop original depth keys (we've stored processed depth in depth_raw)
-            if self.use_depth:
-                for k in list(obs.keys()):
-                    if "depth" in k.lower() and k != "depth_raw":
-                        obs.pop(k, None)
 
         # 2) Language (string)
         lang = comp.get(self.language_key)
@@ -639,48 +562,11 @@ def collate(features: list[dict[str, Any]], eagle_processor: ProcessorMixin) -> 
     return batch
 
 
-def _normalize_depth_for_fusion(
-    depth: torch.Tensor,
-    depth_scale: float = 1.0,
-    depth_mean: float = 0.5,
-    depth_std: float = 0.5,
-) -> torch.Tensor:
-    """Normalize depth tensor to match the scale of Eagle-processed RGB.
-    
-    Eagle RGB processing: pixel_values are normalized with ImageNet stats,
-    resulting in values roughly in [-2, 2] range.
-    
-    For depth, we apply a simple linear normalization:
-    1. Scale raw depth by depth_scale (e.g., 1/1000 for mm->m, or 1/10 for m->normalized)
-    2. Apply (depth - mean) / std to center around 0
-    
-    Args:
-        depth: Raw depth tensor (B, 1, H, W) in original units (mm or m)
-        depth_scale: Scale factor to apply to raw depth (default 1.0 = no scaling)
-        depth_mean: Mean for normalization (default 0.5)
-        depth_std: Std for normalization (default 0.5)
-        
-    Returns:
-        Normalized depth tensor suitable for concatenation with RGB pixel_values
-    """
-    # Apply scale (e.g., convert mm to meters, or normalize to expected range)
-    depth_scaled = depth * depth_scale
-    # Normalize similar to how RGB is normalized
-    depth_normalized = (depth_scaled - depth_mean) / depth_std
-    return depth_normalized
-
-
 @dataclass
 @ProcessorStepRegistry.register(name="groot_eagle_collate_v3")
 class GrootEagleCollateStep(ProcessorStep):
     tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO
-    # Depth normalization parameters for late fusion
-    # Set depth_scale based on your depth units: 1/1000 for mm, 1/10 for m (to get ~[0,1] range)
-    depth_scale: float = 0.001  # Default assumes depth in mm, converts to meters
-    depth_mean: float = 0.5  # Center depth around 0 after scaling
-    depth_std: float = 0.5   # Scale to roughly match RGB normalized range
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
-    _logged_first_depth: bool = field(default=False, init=False, repr=False)
     _logged_first_rgb: bool = field(default=False, init=False, repr=False)
 
     @property
@@ -704,159 +590,16 @@ class GrootEagleCollateStep(ProcessorStep):
         for k, v in batched.items():
             comp[k] = v
         comp.pop("eagle_content", None)
-        
-        # Late fusion: concatenate depth with RGB pixel_values if depth_raw exists
-        depth_raw = obs.get("depth_raw")
-        # depth_raw: (B, 1, V, 1, H, W) - raw depth values
-        # eagle_pixel_values: (N, 3, H', W') where N = B * T * V, normalized RGB
+
         assert "eagle_pixel_values" in comp, "[GROOT] eagle_pixel_values not found in complementary data after collate."
         pixel_values = comp["eagle_pixel_values"]  # (N, 3, H', W')
-        if depth_raw is not None and "eagle_pixel_values" in comp:
-            n, c, h_pv, w_pv = pixel_values.shape  # [3, 3, 224, 224]
-            
-            # Reshape depth to match pixel_values layout
-            # depth_raw is (B, T=1, V, 1, H, W), we need (N, 1, H', W')
-            b, t, v, _, h_d, w_d = depth_raw.shape  # [3, 1, 1, 1, 256, 256]
-            depth_flat = depth_raw.view(b * t * v, 1, h_d, w_d)  # (N, 1, H, W)
-
-            assert depth_flat.shape[0] == pixel_values.shape[0]
-            
-            # Resize depth to match pixel_values spatial dims if needed
-            # even though we already matched the depth to the rgb, the rgb is resized inside eagle processor
-            # this resize happens inside the `collate(features, self.proc)` call above
-            if h_d != h_pv or w_d != w_pv:
-                depth_flat = torch.nn.functional.interpolate(
-                    depth_flat, size=(h_pv, w_pv), mode='nearest'
-                )
-            
-            # Normalize depth for fusion (converts raw values to normalized scale)
-            depth_normalized = _normalize_depth_for_fusion(
-                depth_flat,
-                depth_scale=self.depth_scale,
-                depth_mean=self.depth_mean,
-                depth_std=self.depth_std,
-            )
-
-            # our scaling is not doing anything on purpose (mean 0, std 1, scale 1) given in the cli command
-            # depth_flat == depth_normalized and are in meters
-
-            # Concatenate depth as 4th channel: (N, 4, H', W')
-            pixel_values_rgbd = torch.cat([pixel_values, depth_normalized], dim=1)
-            comp["eagle_pixel_values"] = pixel_values_rgbd
-            
-            # Log depth stats for first frame only (deterministic, for comparison between runs)
-            if not self._logged_first_depth:
-                self._logged_first_depth = True
-                # First frame of first batch element
-                first_depth_raw = depth_flat[0, 0]  # RAW depth before normalization
-                first_depth = depth_normalized[0, 0]  # (H', W')
-                first_rgb = pixel_values[0]  # (3, H', W')
-                
-                # Check for suspicious patterns (all rows identical = likely bug)
-                unique_rows = torch.unique(first_depth_raw, dim=0).shape[0]
-                unique_cols = torch.unique(first_depth_raw, dim=1).shape[0]
-                
-                print(f"[GROOT DEPTH DEBUG RAW] Before normalization:")
-                print(f"  Shape: {first_depth_raw.shape}")
-                print(f"  Min: {first_depth_raw.min().item():.6f}, Max: {first_depth_raw.max().item():.6f}")
-                print(f"  Mean: {first_depth_raw.mean().item():.6f}, Std: {first_depth_raw.std().item():.6f}")
-                print(f"  Unique rows: {unique_rows}/{first_depth_raw.shape[0]}, Unique cols: {unique_cols}/{first_depth_raw.shape[1]}")
-                print(f"  Corner samples: TL={first_depth_raw[0,0].item():.6f}, TR={first_depth_raw[0,-1].item():.6f}, BL={first_depth_raw[-1,0].item():.6f}, BR={first_depth_raw[-1,-1].item():.6f}")
-                if unique_rows < 10:
-                    print(f"  WARNING: Only {unique_rows} unique rows - depth image may be corrupted!")
-
-                print(first_depth)
-
-                print(f"[GROOT DEPTH DEBUG] First frame depth stats (normalized, before network):")
-                print(f"  Shape: {first_depth.shape}")
-                print(f"  Min: {first_depth.min().item():.6f}, Max: {first_depth.max().item():.6f}")
-                print(f"  Mean: {first_depth.mean().item():.6f}, Std: {first_depth.std().item():.6f}")
-                print(f"  Sample values [0,0]: {first_depth[0,0].item():.6f}, [H//2,W//2]: {first_depth[first_depth.shape[0]//2, first_depth.shape[1]//2].item():.6f}")
-                print(f"  RGB channel means: R={first_rgb[0].mean().item():.4f}, G={first_rgb[1].mean().item():.4f}, B={first_rgb[2].mean().item():.4f}")
-                
-                # Save depth and RGB images for visual comparison between train and eval
-                try:
-                    import os
-                    from PIL import Image as PILImage
-                    
-                    # Determine if this is training or eval based on model mode
-                    # During training, self.training would be True on the model, but we don't have direct access
-                    # Use a heuristic: check if we're in output_rgb or output_rgbd folder context
-                    mode_suffix = "unknown"
-                    # Try to detect from environment or just use timestamp to make unique
-                    import time
-                    timestamp = int(time.time())
-                    
-                    output_dir = "./output"
-                    os.makedirs(output_dir, exist_ok=True)
-                    
-                    # Save RAW depth (before normalization) - in meters, normalize to 0-255 for visualization
-                    depth_vis = first_depth_raw.cpu().numpy()
-                    # Clip to 0-5m range and normalize to 0-255
-                    depth_vis_clipped = np.clip(depth_vis, 0, 5.0)
-                    depth_vis_uint8 = (depth_vis_clipped / 5.0 * 255).astype(np.uint8)
-                    depth_img = PILImage.fromarray(depth_vis_uint8, mode='L')
-                    depth_path = os.path.join(output_dir, f"debug_depth_raw_{timestamp}.png")
-                    depth_img.save(depth_path)
-                    print(f"  [DEBUG] Saved raw depth image to: {depth_path}")
-                    
-                    # Save normalized depth
-                    depth_norm_vis = first_depth.cpu().numpy()
-                    # Normalized depth is roughly in [-2, 2] range, map to 0-255
-                    depth_norm_clipped = np.clip((depth_norm_vis + 2.0) / 4.0, 0, 1)
-                    depth_norm_uint8 = (depth_norm_clipped * 255).astype(np.uint8)
-                    depth_norm_img = PILImage.fromarray(depth_norm_uint8, mode='L')
-                    depth_norm_path = os.path.join(output_dir, f"debug_depth_normalized_{timestamp}.png")
-                    depth_norm_img.save(depth_norm_path)
-                    print(f"  [DEBUG] Saved normalized depth image to: {depth_norm_path}")
-                    
-                    # Save RGB image
-                    rgb_vis = first_rgb.cpu().numpy()  # (3, H, W)
-                    # RGB is normalized with ImageNet stats, denormalize: x * std + mean
-                    # ImageNet: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                    # But Eagle uses mean=0.5, std=0.5
-                    rgb_denorm = rgb_vis * 0.5 + 0.5  # Assuming Eagle normalization
-                    rgb_denorm = np.clip(rgb_denorm, 0, 1)
-                    rgb_uint8 = (rgb_denorm * 255).astype(np.uint8)
-                    rgb_uint8 = np.transpose(rgb_uint8, (1, 2, 0))  # (H, W, 3)
-                    rgb_img = PILImage.fromarray(rgb_uint8, mode='RGB')
-                    rgb_path = os.path.join(output_dir, f"debug_rgb_{timestamp}.png")
-                    rgb_img.save(rgb_path)
-                    print(f"  [DEBUG] Saved RGB image to: {rgb_path}")
-                    
-                except Exception as e:
-                    print(f"  [DEBUG] Failed to save debug images: {e}")
-                
-                # Log Eagle processor config for train vs eval comparison
-                print(f"\n[GROOT EAGLE PROCESSOR CONFIG]")
-                print(f"  Processor type: {type(self.proc).__name__}")
-                if hasattr(self.proc, 'image_processor'):
-                    img_proc = self.proc.image_processor
-                    print(f"  Image processor type: {type(img_proc).__name__}")
-                    # Print all config attributes
-                    for attr in ['do_convert_rgb', 'do_normalize', 'do_rescale', 'do_resize', 
-                                 'image_mean', 'image_std', 'rescale_factor', 'size',
-                                 'data_format', 'tokens_per_tile', 'use_thumbnail',
-                                 'min_dynamic_tiles', 'max_dynamic_tiles']:
-                        if hasattr(img_proc, attr):
-                            print(f"    {attr}: {getattr(img_proc, attr)}")
-                if hasattr(self.proc, 'tokenizer'):
-                    tok = self.proc.tokenizer
-                    print(f"  Tokenizer type: {type(tok).__name__}")
-                    print(f"    padding_side: {getattr(tok, 'padding_side', 'N/A')}")
-                print("")
-            
-            # Clean up depth_raw
-            obs.pop("depth_raw", None)
 
         if not self._logged_first_rgb:
             self._logged_first_rgb = True
-            print(f"rgb value at     (0, 0): {pixel_values[0][:, 0, 0]}")  # Print RGB values at (0,0)
-            print(f"rgb value at (223, 223): {pixel_values[0][:, -1, -1]}")  # Print RGB values at (224,224)
-        
-        obs.pop(
-            "video", None
-        )  # The video has been fully encoded into eagle_* tensors, so we don't need the raw video anymore
+            print(f"rgb value at     (0, 0): {pixel_values[0][:, 0, 0]}")
+            print(f"rgb value at (223, 223): {pixel_values[0][:, -1, -1]}")
+
+        obs.pop("video", None)
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
         return transition
@@ -866,14 +609,13 @@ class GrootEagleCollateStep(ProcessorStep):
 
 
 @dataclass
-@ProcessorStepRegistry.register(name="groot_voxel_prep_v1")
-class GrootVoxelPrepStep(ProcessorStep):
+@ProcessorStepRegistry.register(name="groot_dgcnn_prep_v1")
+class GrootDgcnnPrepStep(ProcessorStep):
     """Prepare DGCNN encoder inputs from depth and camera params.
 
-    Extracts depth, intrinsics, and extrinsics from observations
-    and stores them as voxel_* keys in complementary data for the
-    EagleBackbone to pass to DGCNNEncoder.  RGB is NOT used — the
-    DGCNN operates on XYZ point clouds only.
+    Self-contained: extracts depth directly from ``obs["observation.images.*.depth"]``
+    keys, along with intrinsics and extrinsics, and stores them as ``dgcnn_*`` keys
+    in complementary data for the EagleBackbone to pass to DGCNNEncoder.
     """
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -888,20 +630,35 @@ class GrootVoxelPrepStep(ProcessorStep):
             transition[TransitionKey.COMPLEMENTARY_DATA] = comp
             return transition
 
-        # Get depth from depth_raw (set by GrootPackInputsStep)
-        depth_raw = obs.get("depth_raw")
-        if depth_raw is None:
+        # Extract depth tensors directly from observation keys
+        depth_keys = sorted([k for k in obs if k.startswith("observation.images.") and "depth" in k.lower()])
+        if not depth_keys:
             transition[TransitionKey.OBSERVATION] = obs
             transition[TransitionKey.COMPLEMENTARY_DATA] = comp
             return transition
 
-        # depth_raw: (B, T, V, 1, H, W) — take first timestep, keep views
-        B, T, V, C, H, W = depth_raw.shape
-        voxel_depth = depth_raw[:, 0, :, :, :, :]  # (B, V, 1, H, W)
-        voxel_depth = voxel_depth.to(torch.float32)
+        depth_tensors = []
+        for dk in depth_keys:
+            d = obs[dk]
+            if isinstance(d, torch.Tensor):
+                if d.dim() == 2:  # (H, W)
+                    d = d.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                elif d.dim() == 3:  # (B, H, W)
+                    d = d.unsqueeze(1)  # (B, 1, H, W)
+                depth_tensors.append(d.to(torch.float32))
+
+        if not depth_tensors:
+            transition[TransitionKey.OBSERVATION] = obs
+            transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+            return transition
+
+        # Stack depth tensors: (B, V, 1, H, W)
+        dgcnn_depth = torch.stack(depth_tensors, dim=1)  # (B, V, 1, H, W)
+        B, V = dgcnn_depth.shape[:2]
+
         # Convert mm to meters if needed
-        if voxel_depth.max() > 100:
-            voxel_depth = voxel_depth / 1000.0
+        if dgcnn_depth.max() > 100:
+            dgcnn_depth = dgcnn_depth / 1000.0
 
         # Ensure camera params have batch and view dims: (B, V, 3, 3) and (B, V, 4, 4)
         if isinstance(intrinsics, torch.Tensor):
@@ -915,13 +672,13 @@ class GrootVoxelPrepStep(ProcessorStep):
             elif extrinsics.dim() == 3 and extrinsics.shape[0] == B:  # (B, 4, 4) -> (B, 1, 4, 4)
                 extrinsics = extrinsics.unsqueeze(1).expand(-1, V, -1, -1)
 
-        assert voxel_depth.abs().sum() > 0, (
-            "voxel_depth is all zeros — depth data not loaded correctly from dataset"
+        assert dgcnn_depth.abs().sum() > 0, (
+            "dgcnn_depth is all zeros — depth data not loaded correctly from dataset"
         )
 
-        comp["voxel_depth"] = voxel_depth
-        comp["voxel_intrinsics"] = intrinsics.to(torch.float32) if isinstance(intrinsics, torch.Tensor) else intrinsics
-        comp["voxel_extrinsics"] = extrinsics.to(torch.float32) if isinstance(extrinsics, torch.Tensor) else extrinsics
+        comp["dgcnn_depth"] = dgcnn_depth
+        comp["dgcnn_intrinsics"] = intrinsics.to(torch.float32) if isinstance(intrinsics, torch.Tensor) else intrinsics
+        comp["dgcnn_extrinsics"] = extrinsics.to(torch.float32) if isinstance(extrinsics, torch.Tensor) else extrinsics
 
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp

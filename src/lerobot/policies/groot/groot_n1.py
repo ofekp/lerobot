@@ -47,7 +47,7 @@ from lerobot.policies.groot.action_head.flow_matching_action_head import (
     FlowmatchingActionHeadConfig,
 )
 from lerobot.policies.groot.utils import ensure_eagle_cache_ready
-from lerobot.policies.groot.voxel_encoder import DGCNNEncoder
+from lerobot.policies.groot.dgcnn_encoder import DGCNNEncoder
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_model").resolve())
@@ -67,10 +67,7 @@ class EagleBackbone(nn.Module):
         tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO,
         project_to_dim: int = 1536,
         use_depth: bool = False,
-        depth_weight_init: str = "rgb_average",
-        _skip_depth_init: bool = False,
-        use_voxel: bool = False,
-        voxel_workspace_bounds: tuple = ((-0.3, 0.3), (-0.3, 0.3), (0.6, 1.0)),
+        dgcnn_workspace_bounds: tuple = ((-0.3, 0.3), (-0.3, 0.3), (0.6, 1.0)),
         dgcnn_num_points: int = 2048,
         dgcnn_k: int = 20,
         dgcnn_num_tokens: int = 64,
@@ -79,22 +76,14 @@ class EagleBackbone(nn.Module):
         Args:
             tune_llm: whether to tune the LLM model (default: True)
             tune_visual: whether to tune the visual model (default: False)
-            use_depth: whether to use RGB-D (4-channel) input instead of RGB (3-channel)
-            depth_weight_init: method to initialize depth channel weights
-                - "rgb_average": Initialize as average of RGB channels (recommended)
-                - "zero": Initialize to zero
-                - "random": Random initialization (default PyTorch init)
+            use_depth: whether to enable DGCNN point cloud encoder + depth rendering in eval
 
         config - https://huggingface.co/lerobot/eagle2hg-processor-groot-n1p5/blob/main/config.json
         from_pretrained - https://github.com/huggingface/transformers/blob/v5.0.0rc2/src/transformers/modeling_utils.py#L3656
         """
-        print(f"[GROOT] Initializing EagleBackbone with use_depth={use_depth}, _skip_depth_init={_skip_depth_init}")
+        print(f"[GROOT] Initializing EagleBackbone with use_depth={use_depth}")
         super().__init__()
         assert not reproject_vision, "Reproject vision is not implemented here, set to False"
-
-        self.use_depth = use_depth
-        self.depth_weight_init = depth_weight_init
-        self._depth_extended = False
 
         # Prefer loading Eagle model config from the cache directory where vendor files were copied.
         vendor_dir = DEFAULT_VENDOR_EAGLE_PATH
@@ -122,29 +111,21 @@ class EagleBackbone(nn.Module):
 
         self.eagle_model = AutoModel.from_config(config, trust_remote_code=True)
 
-        # Depth extension strategy:
-        # - Eval (loading 4-channel checkpoint): extend now so shapes match when loading weights
-        # - Training (loading 3-channel HF checkpoint): defer extension until after weights are loaded,
-        #   so we can initialize depth channel as rgb_average of pretrained RGB weights
-        if self.use_depth and not _skip_depth_init:
-            self._extend_patch_embedding_for_depth()
-            self._depth_extended = True
-
         if project_to_dim is not None:
             self.eagle_linear = torch.nn.Linear(2048, project_to_dim)
         else:
             self.eagle_linear = torch.nn.Identity()
 
         # DGCNN point cloud encoder for 3D spatial tokens
-        self.use_voxel = use_voxel
+        self.use_depth = use_depth
         self.point_cloud_encoder = None
-        if self.use_voxel:
+        if self.use_depth:
             self.point_cloud_encoder = DGCNNEncoder(
                 num_points=dgcnn_num_points,
                 k=dgcnn_k,
                 hidden_dim=project_to_dim if project_to_dim is not None else 2048,
                 num_tokens=dgcnn_num_tokens,
-                workspace_bounds=voxel_workspace_bounds,
+                workspace_bounds=dgcnn_workspace_bounds,
             )
             print(f"[GROOT] DGCNNEncoder initialized: points={dgcnn_num_points}, k={dgcnn_k}, "
                   f"tokens={self.point_cloud_encoder.num_tokens}, "
@@ -156,199 +137,6 @@ class EagleBackbone(nn.Module):
 
         self.select_layer = select_layer
         self.set_trainable_parameters(tune_llm, tune_visual)
-        
-        # For depth gradient monitoring
-        self._depth_grad_step_counter = 0
-        self._depth_grad_hook_handle = None
-
-    def register_depth_gradient_hook(self, log_every_n_steps: int = 5000):
-        """Register a hook to monitor depth channel gradients during training.
-        Args:
-            log_every_n_steps: Print gradient stats every N backward passes.
-        """
-        if not self.use_depth or not self._depth_extended:
-            print("[GROOT] Cannot register depth gradient hook: depth not enabled or not extended yet.")
-            return
-        patch_embed = self.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-        def hook(grad):
-            if self._depth_grad_step_counter % log_every_n_steps == 0:
-                depth_grad = grad[:, 3:4, :, :]
-                rgb_grad = grad[:, :3, :, :]
-                # Also print current weight and bias values to track updates
-                depth_weight = patch_embed.weight[:, 3:4, :, :]
-                rgb_weight = patch_embed.weight[:, :3, :, :]
-                bias_str = ""
-                if patch_embed.bias is not None:
-                    bias_str = f", bias norm: {patch_embed.bias.norm().item():.6f}, bias mean: {patch_embed.bias.mean().item():.6f}"
-                print(f"[Depth Grad Monitor @ step {self._depth_grad_step_counter}] "
-                      f"Depth grad norm: {depth_grad.norm().item():.6f}, "
-                      f"RGB grad norm: {rgb_grad.norm().item():.6f}, "
-                      f"Depth weight norm: {depth_weight.norm().item():.6f}, "
-                      f"RGB weight norm: {rgb_weight.norm().item():.6f}"
-                      f"{bias_str}",
-                      flush=True)
-            self._depth_grad_step_counter += 1
-            return grad
-        self._depth_grad_hook_handle = patch_embed.weight.register_hook(hook)
-        print(f"[GROOT] Depth gradient hook registered (logging every {log_every_n_steps} steps)")
-
-    def extend_patch_embedding_for_depth(self):
-        """Public method to extend patch embedding for depth after pretrained weights are loaded.
-        
-        This should be called after from_pretrained() loads the 3-channel weights.
-        If the loaded weights already have 4 channels (i.e., checkpoint was trained with depth),
-        this method will skip the extension to preserve the trained depth weights.
-        """
-        if self._depth_extended:
-            print("[GROOT] Patch embedding already extended for depth, skipping.")
-            return
-        if not self.use_depth:
-            print("[GROOT] use_depth is False, skipping depth extension.")
-            return
-        
-        # Check if patch embedding already has 4 channels (loaded from depth-trained checkpoint)
-        vision_model = self.eagle_model.vision_model
-        patch_embed = vision_model.vision_model.embeddings.patch_embedding
-        
-        if isinstance(patch_embed, nn.Conv2d):
-            current_in_channels = patch_embed.weight.shape[1]
-        elif isinstance(patch_embed, nn.Linear):
-            # For linear, assume patch_size can be inferred
-            in_features = patch_embed.weight.shape[1]
-            # Try 4 channels first
-            patch_area_4ch = in_features // 4
-            patch_size_4ch = int(patch_area_4ch ** 0.5)
-            if patch_size_4ch * patch_size_4ch * 4 == in_features:
-                current_in_channels = 4
-            else:
-                current_in_channels = 3  # Assume 3 if not 4
-        else:
-            current_in_channels = 3  # Default assumption
-        
-        if current_in_channels == 4:
-            print("[GROOT] Patch embedding already has 4 channels (loaded from depth-trained checkpoint), skipping extension.")
-            self._depth_extended = True
-            return
-        
-        self._extend_patch_embedding_for_depth()
-        self._depth_extended = True
-
-    def _extend_patch_embedding_for_depth(self):
-        """Extend the vision model's patch embedding from 3 to 4 channels.
-        
-        Following the paper "Modality-Augmented Fine-Tuning of Foundation Robot Policies":
-        - Expand the patch embedding from 3 to 4 channels for RGB-D fusion
-        - Initialize depth-channel weights using RGB kernel averaging:
-          W_patch(D) = 1/3 * (W_patch(R) + W_patch(G) + W_patch(B))
-        """
-        vision_model = self.eagle_model.vision_model
-        
-        # Find the patch embedding layer - it's typically in the embeddings
-        # patch_embed = None
-        # patch_embed_attr = None
-        
-        # Try common paths for patch embedding in various ViT architectures
-        # possible_paths = [   
-        #     ('embeddings', 'patch_embedding'),
-        #     ('embeddings', 'patch_embeddings', 'projection'),
-        #     ('patch_embed', 'proj'),
-        #     ('patch_embedding',),
-        # ]
-        
-        patch_embed_attr = ["vision_model", "embeddings", "patch_embedding"]
-        obj = vision_model
-        for attr in patch_embed_attr:
-            obj = getattr(obj, attr)
-        patch_embed = obj
-
-        if not (isinstance(obj, nn.Conv2d) or isinstance(obj, nn.Linear)):
-            raise ValueError(f"Unexpected patch embedding type: {type(obj)}")
-        
-        print(f"[GROOT] Original patch embedding shape: {patch_embed.weight.shape}")
-        
-        if isinstance(patch_embed, nn.Conv2d):
-            # Conv2d patch embedding: weight shape is (out_channels, in_channels, H, W)
-            old_weight = patch_embed.weight.data  # (out, 3, H, W)
-            out_channels, in_channels, kh, kw = old_weight.shape
-            
-            if in_channels != 3:
-                print(f"[GROOT] Warning: Expected 3 input channels, got {in_channels}. Skipping depth extension.")
-                return
-            
-            # Create new Conv2d with 4 input channels
-            new_conv = nn.Conv2d(
-                in_channels=4,
-                out_channels=out_channels,
-                kernel_size=(kh, kw),
-                stride=patch_embed.stride,
-                padding=patch_embed.padding,
-                bias=patch_embed.bias is not None,
-            )
-            
-            # Initialize: copy RGB weights, init depth channel
-            with torch.no_grad():
-                new_conv.weight[:, :3, :, :] = old_weight
-                if self.depth_weight_init == "rgb_average":
-                    # Average of RGB channels as recommended in paper
-                    depth_init = old_weight.mean(dim=1, keepdim=True)
-                    new_conv.weight[:, 3:4, :, :] = depth_init
-                elif self.depth_weight_init == "zero":
-                    new_conv.weight[:, 3:4, :, :] = 0.0
-                # "random" uses default PyTorch initialization (already done)
-                if patch_embed.bias is not None:
-                    new_conv.bias.copy_(patch_embed.bias)
-            
-            # Replace the old conv with the new one
-            self._replace_module(vision_model, patch_embed_attr, new_conv)
-            print(f"[GROOT] Extended patch embedding to 4 channels (RGB-D)")
-            print(f"[GROOT] New patch embedding shape: {new_conv.weight.shape}")
-            
-        elif isinstance(patch_embed, nn.Linear):
-            # Linear patch embedding: weight shape is (out_features, in_features)
-            # in_features = patch_size * patch_size * 3
-            old_weight = patch_embed.weight.data
-            out_features, in_features = old_weight.shape
-            
-            # Assume patch_size is square root of in_features / 3
-            patch_area = in_features // 3
-            patch_size = int(patch_area ** 0.5)
-            
-            if patch_size * patch_size * 3 != in_features:
-                print(f"[GROOT] Warning: Cannot determine patch size from in_features={in_features}. Skipping.")
-                return
-            
-            # Create new Linear with 4 channels
-            new_in_features = patch_size * patch_size * 4
-            new_linear = nn.Linear(new_in_features, out_features, bias=patch_embed.bias is not None)
-            
-            with torch.no_grad():
-                # Reshape old weights to (out, patch_size, patch_size, 3) for manipulation
-                old_reshaped = old_weight.view(out_features, patch_size, patch_size, 3)
-                
-                if self.depth_weight_init == "rgb_average":
-                    depth_init = old_reshaped.mean(dim=-1, keepdim=True)
-                elif self.depth_weight_init == "zero":
-                    depth_init = torch.zeros(out_features, patch_size, patch_size, 1, device=old_weight.device)
-                else:  # random
-                    depth_init = torch.randn(out_features, patch_size, patch_size, 1, device=old_weight.device) * 0.02
-                
-                # Concatenate RGB + D
-                new_reshaped = torch.cat([old_reshaped, depth_init], dim=-1)
-                new_linear.weight.copy_(new_reshaped.view(out_features, -1))
-                
-                if patch_embed.bias is not None:
-                    new_linear.bias.copy_(patch_embed.bias)
-            
-            self._replace_module(vision_model, patch_embed_attr, new_linear)
-            print(f"[GROOT] Extended patch embedding to 4 channels (RGB-D)")
-            print(f"[GROOT] New patch embedding shape: {new_linear.weight.shape}")
-
-    def _replace_module(self, parent: nn.Module, path: tuple, new_module: nn.Module):
-        """Replace a nested module given its path."""
-        obj = parent
-        for attr in path[:-1]:
-            obj = getattr(obj, attr)
-        setattr(obj, path[-1], new_module)
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool):
         self.tune_llm = tune_llm
@@ -360,19 +148,6 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
-        if self.use_depth:
-            # Enable gradients for the patch embedding but use a hook to zero out
-            # RGB gradients, following the paper's approach of only training depth weights
-            patch_embed = self.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-            patch_embed.weight.requires_grad = True
-            if patch_embed.bias is not None:
-                patch_embed.bias.requires_grad = True
-            
-            # Register gradient hook to only train depth channel (channel 3)
-            # This zeros out gradients for RGB channels (0:3), keeping only depth gradients
-            self._register_depth_only_gradient_hook(patch_embed)
-            print(f"[GROOT] Patch embedding: training ONLY depth channel (frozen RGB channels 0:3)")
-            print(f"Tune backbone patch embedding (depth): weight=True, bias={patch_embed.bias is not None}")
         print(f"Tune backbone llm: {self.tune_llm}")
         print(f"Tune backbone visual: {self.tune_visual}")
         # Check if any parameters are still trainable. If not, print a warning.
@@ -382,30 +157,6 @@ class EagleBackbone(nn.Module):
                     print(f"Backbone trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No backbone trainable parameters found.")
-    
-    def _register_depth_only_gradient_hook(self, patch_embed: nn.Module):
-        """Register a gradient hook that zeros out RGB channel gradients.
-        
-        Following the paper "Modality-Augmented Fine-Tuning of Foundation Robot Policies":
-        - The vision tower (including RGB patch embedding weights) is frozen
-        - Only the newly added depth channel weights are trained
-        
-        For Conv2d: weight shape is (out_channels, in_channels, H, W)
-            - in_channels 0:3 are RGB (frozen)
-            - in_channels 3:4 is depth (trainable)
-        """
-        def zero_rgb_gradients(grad):
-            # Clone to avoid in-place modification issues
-            new_grad = grad.clone()
-            # Zero out gradients for RGB channels (indices 0, 1, 2)
-            new_grad[:, :3, :, :] = 0.0
-            return new_grad
-        
-        # Store the hook handle so we can remove it if needed
-        if hasattr(self, '_depth_grad_hook'):
-            self._depth_grad_hook.remove()
-        self._depth_grad_hook = patch_embed.weight.register_hook(zero_rgb_gradients)
-        print(f"[GROOT] Registered gradient hook to freeze RGB channels (0:3), train only depth channel (3)")
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -451,10 +202,10 @@ class EagleBackbone(nn.Module):
             eagle_embeds = eagle_embeds + dummy_term
 
         # DGCNN point cloud encoder: concat 3D spatial tokens with Eagle tokens
-        if self.use_voxel and self.point_cloud_encoder is not None:
-            pc_depth = vl_input.get("voxel_depth")
-            pc_intrinsics = vl_input.get("voxel_intrinsics")
-            pc_extrinsics = vl_input.get("voxel_extrinsics")
+        if self.use_depth and self.point_cloud_encoder is not None:
+            pc_depth = vl_input.get("dgcnn_depth")
+            pc_intrinsics = vl_input.get("dgcnn_intrinsics")
+            pc_extrinsics = vl_input.get("dgcnn_extrinsics")
 
             if all(v is not None for v in [pc_depth, pc_intrinsics, pc_extrinsics]):
                 pc_tokens = self.point_cloud_encoder(
@@ -486,7 +237,7 @@ class EagleBackbone(nn.Module):
             else:
                 import warnings
                 warnings.warn(
-                    "use_voxel=True but voxel_depth/intrinsics/extrinsics missing from input — "
+                    "use_depth=True but dgcnn_depth/intrinsics/extrinsics missing from input — "
                     "DGCNN is configured but NOT being used this forward pass",
                     RuntimeWarning, stacklevel=2,
                 )
@@ -551,10 +302,6 @@ class GR00TN15(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
-        
-        # Track if depth is enabled (for validation)
-        self.use_depth = config.backbone_cfg.get("use_depth", False)
-        self.expected_color_channels = 4 if self.use_depth else N_COLOR_CHANNELS
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -585,8 +332,7 @@ class GR00TN15(PreTrainedModel):
             video = inputs["video"]
             type_ok = isinstance(video, np.ndarray)
             dtype_ok = video.dtype == np.uint8
-            # Allow 3 channels (RGB) or 4 channels (RGB-D) depending on config
-            shape_ok = len(video.shape) == 6 and video.shape[3] == self.expected_color_channels
+            shape_ok = len(video.shape) == 6 and video.shape[3] == N_COLOR_CHANNELS
             if not type_ok:
                 error_msg += f"\n{type(video)=}"
                 detected_error = True
@@ -594,7 +340,7 @@ class GR00TN15(PreTrainedModel):
                 error_msg += f"\n{video.dtype=}"
                 detected_error = True
             if not shape_ok:
-                error_msg += f"\n{video.shape=} (expected channels={self.expected_color_channels})"
+                error_msg += f"\n{video.shape=} (expected channels={N_COLOR_CHANNELS})"
                 detected_error = True
 
         if detected_error:
@@ -682,28 +428,20 @@ class GR00TN15(PreTrainedModel):
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
-        
-        # Depth modality settings (following "Modality-Augmented Fine-Tuning" paper)
-        use_depth = kwargs.pop("use_depth", False)
-        depth_weight_init = kwargs.pop("depth_weight_init", "rgb_average")
 
         # DGCNN point cloud encoder settings
-        use_voxel = kwargs.pop("use_voxel", False)
-        voxel_workspace_bounds = kwargs.pop("voxel_workspace_bounds", ((-0.3, 0.3), (-0.3, 0.3), (0.6, 1.0)))
+        use_depth = kwargs.pop("use_depth", False)
+        dgcnn_workspace_bounds = kwargs.pop("dgcnn_workspace_bounds", ((-0.3, 0.3), (-0.3, 0.3), (0.6, 1.0)))
         dgcnn_num_points = kwargs.pop("dgcnn_num_points", 2048)
         dgcnn_k = kwargs.pop("dgcnn_k", 20)
         dgcnn_num_tokens = kwargs.pop("dgcnn_num_tokens", 64)
-
-        print(f"Use point cloud encoder (DGCNN): {use_voxel}")
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
         print(f"Tune action head DiT: {tune_diffusion_model}")
-        print(f"Use depth (RGB-D): {use_depth}")
-        if use_depth:
-            print(f"Depth weight initialization: {depth_weight_init}")
+        print(f"Use depth (DGCNN): {use_depth}")
 
         # Download model or use local path
         try:
@@ -713,134 +451,66 @@ class GR00TN15(PreTrainedModel):
             local_model_path = pretrained_model_name_or_path
 
         # Detect if this is a LeRobot checkpoint (for eval) or HuggingFace model (for training)
-        # LeRobot checkpoints have keys prefixed with "_groot_model."
-        # Also check if checkpoint has 4-channel patch embedding (depth-trained)
         safetensor_path = os.path.join(local_model_path, "model.safetensors")
         is_lerobot_checkpoint = False
-        checkpoint_has_4_channels = False
-        
-        patch_embed_key = "_groot_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding.weight"
-        
-        def _print_patch_embed_weights(weights, label, use_depth_flag):
-            """Print first few weights of each channel for debugging."""
-            # weights shape: (out_channels, in_channels, H, W) for Conv2d
-            print(f"\n[GROOT PATCH EMBED DEBUG] {label}")
-            print(f"  Shape: {weights.shape}")
-            # Flatten spatial dims and take first 5 values per channel
-            flat = weights[:, :, :, :].reshape(weights.shape[0], weights.shape[1], -1)
-            # Take first output channel, first few spatial values
-            for ch, name in enumerate(['R', 'G', 'B']):
-                if ch < weights.shape[1]:
-                    vals = flat[0, ch, :5].tolist()
-                    print(f"  Channel {name}: {[f'{v:.6f}' for v in vals]}")
-            if use_depth_flag and weights.shape[1] >= 4:
-                vals = flat[0, 3, :5].tolist()
-                print(f"  Channel D: {[f'{v:.6f}' for v in vals]}")
-            print("")
-        
+
         if os.path.exists(safetensor_path):
             try:
                 from safetensors import safe_open
                 with safe_open(safetensor_path, framework="pt", device="cpu") as f:
                     all_keys = list(f.keys())
                     is_lerobot_checkpoint = any(k.startswith("_groot_model.") for k in all_keys[:10])
-                    
-                    if patch_embed_key in all_keys:
-                        weights = f.get_tensor(patch_embed_key)
-                        shape = weights.shape
-                        checkpoint_has_4_channels = (shape[1] == 4)
-                        print(f"[GROOT] Checkpoint patch embedding: {shape} ({'4-ch depth' if checkpoint_has_4_channels else '3-ch RGB'})")
-                        _print_patch_embed_weights(weights, "Stage 1: From safetensor file", use_depth)
             except Exception as e:
                 print(f"[GROOT] Warning: Could not inspect checkpoint: {e}")
-        
+
         if is_lerobot_checkpoint:
             # EVAL FLOW: Loading a LeRobot-saved checkpoint
-            # We just need to create the model with correct architecture.
-            # Weights will be loaded by PreTrainedPolicy.from_pretrained via load_model_as_safetensor.
             print("[GROOT] Detected LeRobot checkpoint format (eval flow)")
-            
-            # LeRobot's config.json doesn't have backbone_cfg, so load from base model
+
             import json
             base_model_name = "nvidia/GR00T-N1.5-3B"
             try:
                 base_model_path = snapshot_download(base_model_name, repo_type="model")
             except (HFValidationError, RepositoryNotFoundError):
                 raise RuntimeError(f"Cannot download base GROOT model config from {base_model_name}")
-            
+
             config_path = os.path.join(base_model_path, "config.json")
             with open(config_path, "r") as f:
                 config_dict = json.load(f)
-            
-            # Inject depth settings - extend in __init__ since checkpoint has 4-ch weights
+
             if use_depth and "backbone_cfg" in config_dict:
                 config_dict["backbone_cfg"]["use_depth"] = use_depth
-                config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
-                config_dict["backbone_cfg"]["_skip_depth_init"] = False  # Extend in __init__
-
-            if use_voxel and "backbone_cfg" in config_dict:
-                config_dict["backbone_cfg"]["use_voxel"] = use_voxel
-                config_dict["backbone_cfg"]["voxel_workspace_bounds"] = voxel_workspace_bounds
+                config_dict["backbone_cfg"]["dgcnn_workspace_bounds"] = dgcnn_workspace_bounds
                 config_dict["backbone_cfg"]["dgcnn_num_points"] = dgcnn_num_points
                 config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
                 config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
 
             config = cls.config_class(**config_dict)
-
-            # Create model with correct architecture (4-ch if depth)
-            # Don't load weights here - load_model_as_safetensor will handle it
             pretrained_model = cls(config, local_model_path=local_model_path)
-            
-            # Print weights after model creation (before external loading by PreTrainedPolicy)
-            patch_embed = pretrained_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-            _print_patch_embed_weights(patch_embed.weight.data, "Stage 2: Model created with random init (checkpoint will be loaded next by PreTrainedPolicy)", use_depth)
-            print("[GROOT] Note: Stage 2 shows random weights - this is expected. Stage 3 will show correct weights after checkpoint loading.")
-            
+
         else:
             # TRAINING FLOW: Loading from HuggingFace (base model)
-            # Need to load 3-ch weights first, then extend to 4-ch with rgb_average
             print("[GROOT] Detected HuggingFace checkpoint format (training flow)")
-            
-            if use_depth or use_voxel:
+
+            if use_depth:
                 import json
                 config_path = Path(local_model_path) / "config.json"
                 with open(config_path, "r") as f:
                     config_dict = json.load(f)
 
                 if "backbone_cfg" in config_dict:
-                    if use_depth:
-                        config_dict["backbone_cfg"]["use_depth"] = use_depth
-                        config_dict["backbone_cfg"]["depth_weight_init"] = depth_weight_init
-                        config_dict["backbone_cfg"]["_skip_depth_init"] = True  # Don't extend in __init__
-                    if use_voxel:
-                        config_dict["backbone_cfg"]["use_voxel"] = use_voxel
-                        config_dict["backbone_cfg"]["voxel_workspace_bounds"] = voxel_workspace_bounds
-                        config_dict["backbone_cfg"]["dgcnn_num_points"] = dgcnn_num_points
-                        config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
-                        config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
+                    config_dict["backbone_cfg"]["use_depth"] = use_depth
+                    config_dict["backbone_cfg"]["dgcnn_workspace_bounds"] = dgcnn_workspace_bounds
+                    config_dict["backbone_cfg"]["dgcnn_num_points"] = dgcnn_num_points
+                    config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
+                    config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
 
                 config = cls.config_class(**config_dict)
                 kwargs["config"] = config
 
-            # Use HuggingFace's from_pretrained to load base model weights
             pretrained_model = super().from_pretrained(
                 local_model_path, local_model_path=local_model_path, **kwargs
             )
-            
-            # Print weights after HuggingFace loading (Stage 2 & 3 combined - HF creates and loads in one step)
-            patch_embed = pretrained_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-            _print_patch_embed_weights(patch_embed.weight.data, "Stage 2+3: After HuggingFace from_pretrained (weights loaded)", use_depth)
-            
-            # Now extend to 4 channels using rgb_average of the loaded pretrained weights
-            if use_depth:
-                print("[GROOT] Extending patch embedding for depth (3→4 channels with rgb_average of pretrained weights)...")
-                pretrained_model.backbone.extend_patch_embedding_for_depth()
-                # Print weights after depth extension
-                patch_embed = pretrained_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
-                _print_patch_embed_weights(patch_embed.weight.data, "Stage 4: After depth extension (3→4 channels)", use_depth)
-        
-        if use_depth:
-            pretrained_model.backbone.register_depth_gradient_hook(log_every_n_steps=1000)
 
         pretrained_model.backbone.set_trainable_parameters(tune_visual=tune_visual, tune_llm=tune_llm)
         pretrained_model.action_head.set_trainable_parameters(

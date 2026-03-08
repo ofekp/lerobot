@@ -51,32 +51,14 @@ class GrootConfig(PreTrainedConfig):
     # Image preprocessing (adjust to match Groot's expected input)
     image_size: tuple[int, int] = (224, 224)
 
-    # Depth modality augmentation (following the paper: "Modality-Augmented Fine-Tuning 
-    # of Foundation Robot Policies for Cross-Embodiment Manipulation")
-    # When enabled, depth images are concatenated with RGB to form RGB-D (4-channel) input
+    # Depth / DGCNN point cloud encoder
+    # When enabled: depth images are back-projected to 3D point clouds, processed
+    # by the DGCNN encoder, and the resulting tokens are concatenated with Eagle
+    # vision tokens. Eagle always receives 3-channel RGB (no patch embed extension).
+    # Also enables depth rendering during evaluation.
     use_depth: bool = False
 
-    # Method to initialize the depth channel weights in the vision encoder
-    # "rgb_average": Initialize as average of RGB channels (recommended from paper)
-    # "zero": Initialize to zero
-    # "random": Random initialization
-    depth_weight_init: str = "rgb_average"
-
-    # Depth normalization parameters for late fusion (after Eagle RGB processing)
-    # Raw depth values are transformed as: (depth * depth_scale - depth_mean) / depth_std
-    # This should produce values in a similar range to ImageNet-normalized RGB (~[-2, 2])
-    # 
-    # Example configurations:
-    # - Depth in mm, max ~10m:   depth_scale=0.0001, depth_mean=0.5, depth_std=0.5 → range ~[-1, 1]
-    # - Depth in meters, max 10m: depth_scale=0.1, depth_mean=0.5, depth_std=0.5 → range ~[-1, 1]
-    # - Raw depth (no scaling):   depth_scale=1.0, depth_mean=0.0, depth_std=1.0 → keep original values
-    depth_scale: float = 0.001    # Scale factor (default: mm to meters)
-    depth_mean: float = 0.5       # Mean for centering
-    depth_std: float = 0.5        # Std for scaling
-
-    # Point cloud encoder settings (DGCNN for 3D spatial reasoning)
-    use_voxel: bool = False  # enables point cloud encoder (kept for CLI compat)
-    voxel_workspace_bounds: tuple[tuple[float, float], ...] = (
+    dgcnn_workspace_bounds: tuple[tuple[float, float], ...] = (
         (-0.3, 0.3),   # x: left-right
         (-0.3, 0.3),   # y: forward-back
         (0.6, 1.0),    # z: table surface to above

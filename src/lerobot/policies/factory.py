@@ -243,13 +243,6 @@ def make_pre_post_processors(
             preprocessor_overrides["groot_pack_inputs_v3"] = {
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
-                "use_depth": getattr(policy_cfg, "use_depth", False),  # Pass use_depth from CLI
-            }
-            # Also pass depth normalization params to collate step
-            preprocessor_overrides["groot_eagle_collate_v3"] = {
-                "depth_scale": getattr(policy_cfg, "depth_scale", 1.0),
-                "depth_mean": getattr(policy_cfg, "depth_mean", 0.0),
-                "depth_std": getattr(policy_cfg, "depth_std", 1.0),
             }
 
             # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats

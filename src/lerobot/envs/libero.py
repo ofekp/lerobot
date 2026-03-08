@@ -158,7 +158,6 @@ class LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         use_depth: bool = False,
-        use_voxel: bool = False,
     ):
         super().__init__()
         self.task_id = task_id
@@ -170,7 +169,6 @@ class LiberoEnv(gym.Env):
         self.visualization_height = visualization_height
         self.init_states = init_states
         self.use_depth = use_depth
-        self.use_voxel = use_voxel
         self.camera_name = _parse_camera_names(
             camera_name
         )  # agentview_image (main) or robot0_eye_in_hand_image (wrist)
@@ -302,9 +300,9 @@ class LiberoEnv(gym.Env):
                 image = np.concatenate([image, depth_rgb], axis=1)
 
         # If point cloud encoder is active, add point cloud projection to the right
-        if self.use_voxel:
+        if self.use_depth:
             try:
-                from lerobot.policies.groot.voxel_encoder import (
+                from lerobot.policies.groot.dgcnn_encoder import (
                     _point_cloud_cache,
                     render_point_cloud_projections,
                 )
@@ -450,7 +448,7 @@ class LiberoEnv(gym.Env):
             obs["depths"] = depths
 
         # Extract camera intrinsics/extrinsics for voxel encoder
-        if self.use_voxel:
+        if self.use_depth:
             sim = self._env.env.sim
             cam_name_base = self.camera_name[0].replace("_image", "")
             cam_id = sim.model.camera_name2id(cam_name_base)
@@ -486,7 +484,7 @@ class LiberoEnv(gym.Env):
             result = {"pixels": images.copy()}
             if self.use_depth:
                 result["depths"] = depths.copy()
-            if self.use_voxel:
+            if self.use_depth:
                 result["camera_intrinsics"] = obs["camera_intrinsics"]
                 result["camera_extrinsics"] = obs["camera_extrinsics"]
             return result
@@ -625,7 +623,6 @@ def create_libero_envs(
     control_mode: str = "relative",
     episode_length: int | None = None,
     use_depth: bool = False,
-    use_voxel: bool = False,
     camera_name_mapping: dict[str, str] | None = None,
 ) -> dict[str, dict[int, Any]]:
     """
@@ -645,9 +642,8 @@ def create_libero_envs(
 
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
-    # Add use_depth, use_voxel, and camera_name_mapping to gym_kwargs so they get passed to LiberoEnv.__init__
+    # Add use_depth and camera_name_mapping to gym_kwargs so they get passed to LiberoEnv.__init__
     gym_kwargs["use_depth"] = use_depth
-    gym_kwargs["use_voxel"] = use_voxel
     if camera_name_mapping is not None:
         gym_kwargs["camera_name_mapping"] = camera_name_mapping
 
