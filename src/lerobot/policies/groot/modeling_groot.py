@@ -58,6 +58,9 @@ class GrootPolicy(PreTrainedPolicy):
         # Initialize GR00T model using ported components
         self._groot_model = self._create_groot_model()
 
+        # Diagnostics (initialized later via init_diagnostics when output_dir is known)
+        self._diagnostics = None
+
         self.reset()
 
     def _create_groot_model(self):
@@ -104,6 +107,28 @@ class GrootPolicy(PreTrainedPolicy):
     def reset(self):
         """Reset policy state when environment resets."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+
+    def init_diagnostics(self, output_dir, dataset_info=None):
+        """Initialize depth diagnostics. Call before training/eval starts.
+
+        Automatically sets up diagnostics when use_depth is enabled.
+        No-op when depth is disabled.
+
+        Args:
+            output_dir: Path to output directory (e.g., cfg.output_dir).
+            dataset_info: Optional dict with 'camera_names' for validation.
+        """
+        if not self.config.use_depth:
+            return
+        from lerobot.policies.groot.chnet_diagnostics import DepthDiagnostics
+        backbone = self._groot_model.backbone
+        self._diagnostics = DepthDiagnostics(
+            config=self.config,
+            model=backbone,
+            output_dir=output_dir,
+        )
+        backbone._diagnostics = self._diagnostics
+        self._diagnostics.print_startup_banner(dataset_info=dataset_info)
 
     def get_optim_params(self) -> dict:
         return self.parameters()
