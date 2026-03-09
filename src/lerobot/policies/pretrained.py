@@ -223,6 +223,16 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         raise NotImplementedError
 
+    def verify_architecture(self) -> None:
+        """Verify that the loaded model architecture matches the expected configuration.
+
+        Override in subclasses to add policy-specific structural checks
+        (e.g. patch embedding channel count for depth models).
+
+        The default implementation is a no-op.
+        """
+        pass
+
     def push_model_to_hub(
         self,
         cfg: TrainPipelineConfig,

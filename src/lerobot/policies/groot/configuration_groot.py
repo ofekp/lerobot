@@ -57,6 +57,7 @@ class GrootConfig(PreTrainedConfig):
     # vision tokens. Eagle always receives 3-channel RGB (no patch embed extension).
     # Also enables depth rendering during evaluation.
     use_depth: bool = False
+    debug_dir: str = None
 
     dgcnn_workspace_bounds: tuple[tuple[float, float], ...] = (
         (-0.5, 4.5),   # x

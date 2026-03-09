@@ -278,8 +278,9 @@ class LiberoEnv(gym.Env):
         formatted_obs = self._format_raw_obs(raw_obs)
         # image = formatted_obs["pixels"]["image"]
         image = formatted_obs["pixels"][self.camera_name_mapping[self.camera_name[0]]]
-        image = image[::-1, ::-1]  # flip both H and W for visualization
-        assert image.shape[2] == 3
+        # flip vertically for visualization (MuJoCo images are upside-down by default)
+        assert image.ndim == 3 and image.shape[2] == 3
+        image = image[::-1, :, :]
         
         # If depth is enabled, visualize it side-by-side with RGB
         if self.use_depth and "depths" in formatted_obs:
@@ -289,7 +290,8 @@ class LiberoEnv(gym.Env):
             depth_key = self.camera_name_mapping.get(depth_cam)
             if depth_key and depth_key in formatted_obs["depths"]:
                 depth = formatted_obs["depths"][depth_key]
-                depth = depth[::-1, ::-1]  # flip to match image orientation
+                assert depth.ndim == 2 and depth.shape == (self.observation_height, self.observation_width)
+                depth = depth[::-1, :]  # flip veritcally to match RGB orientation
                 # Normalize depth to 0-255 for visualization
                 # Clip to reasonable range (e.g., 0-5 meters = 0-5000mm)
                 depth_vis = np.clip(depth, 0, 5000)

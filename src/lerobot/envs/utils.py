@@ -98,22 +98,11 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
             for key, depth in observations["depths"].items():
                 depth_tensor = torch.from_numpy(depth)
                 
-                # Add batch dimension if needed
-                if depth_tensor.ndim == 2:
-                    # (H, W) -> (1, 1, H, W)
-                    depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
-                elif depth_tensor.ndim == 3:
-                    if depth_tensor.shape[2] == 1:
-                        # (H, W, C) -> (1, 1, H, W)
-                        depth_tensor = depth_tensor.unsqueeze(0)
-                    else:
-                        # (B, H, W) -> (B, 1, H, W)
-                        depth_tensor = depth_tensor.unsqueeze(1)
+                assert depth_tensor.ndim == 3
+                depth_tensor = depth_tensor.unsqueeze(0)  # (1, H, W) -> (1, 1, H, W)
                 
                 # Convert uint16 mm to float32 meters
                 depth_tensor = depth_tensor.to(torch.float32) / 1000.0
-                if torch.rand(1).item() < 0.001:
-                    print(f"Depth tensor (meters): {depth_tensor}")
 
                 # Match the RGB naming convention:
                 # If we have observation.images.image -> use observation.depth.image
@@ -121,14 +110,13 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
                 # TODO(ofekp): later, consider:
                 #   If we have observation.images.image -> use observation.images.image.depth
                 #   If we have observation.image (single) -> use observation.image.depth
+                assert key.endswith(".depth")
                 return_observations[f"{OBS_IMAGES}.{key}"] = depth_tensor
         else:
             # Single depth: just observation.depth
             depth_tensor = torch.from_numpy(observations["depths"])
-            if depth_tensor.ndim == 2:
-                depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
-            elif depth_tensor.ndim == 3:
-                depth_tensor = depth_tensor.unsqueeze(1)
+            assert depth_tensor.ndim == 3
+            depth_tensor = depth_tensor.unsqueeze(0)  # (1, H, W) -> (1, 1, H, W)
             depth_tensor = depth_tensor.to(torch.float32) / 1000.0
             return_observations[f"{OBS_IMAGE}.depth"] = depth_tensor
 
@@ -136,7 +124,6 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
         env_state = torch.from_numpy(observations["environment_state"]).float()
         if env_state.dim() == 1:
             env_state = env_state.unsqueeze(0)
-
         return_observations[OBS_ENV_STATE] = env_state
 
     if "agent_pos" in observations:
