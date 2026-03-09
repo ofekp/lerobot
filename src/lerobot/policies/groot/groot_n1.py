@@ -149,6 +149,9 @@ class EagleBackbone(nn.Module):
         self._depth_grad_step_counter = 0
         self._depth_grad_hook_handle = None
 
+        # Diagnostics module (set externally via GrootPolicy.init_diagnostics)
+        self._diagnostics = None
+
     def register_depth_gradient_hook(self, log_every_n_steps: int = 5000):
         """Register a hook to monitor depth channel gradients during training.
         Args:
@@ -462,12 +465,6 @@ class EagleBackbone(nn.Module):
                     f"(forward call #{self._depth_fwd_count})"
                 )
             self._depth_fwd_count += 1
-            if self._depth_fwd_count <= 3 or self._depth_fwd_count % 5000 == 0:
-                mode = "TRAIN" if self.training else "EVAL"
-                print(f"[GROOT DEPTH OK] [{mode}] fwd #{self._depth_fwd_count}: "
-                      f"depth shape={depth_normalized.shape}, "
-                      f"range=[{depth_normalized.min().item():.4f}, {depth_normalized.max().item():.4f}]",
-                      flush=True)
 
         # Clear hook features before forward
         self._vit_hook_features.clear()
@@ -497,39 +494,53 @@ class EagleBackbone(nn.Module):
                 )
 
             eagle_features_before = eagle_features
-            eagle_features = self.chnet(
-                depth=depth_normalized,
-                vit_features=vit_feats,
-                grid_h=grid_h,
-                grid_w=grid_w,
-                eagle_features=eagle_features,
-            )
 
-            # Verify CHNet actually modified the features meaningfully
+            # Check if diagnostics should collect data this step
+            do_diag = (self._diagnostics is not None
+                       and self._diagnostics.should_report(self._depth_fwd_count, is_training=self.training))
+
+            if do_diag:
+                eagle_features, diag_data = self.chnet(
+                    depth=depth_normalized,
+                    vit_features=vit_feats,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    eagle_features=eagle_features,
+                    return_diagnostics=True,
+                )
+                self._diagnostics.collect(
+                    step=self._depth_fwd_count,
+                    depth_input=depth_normalized,
+                    eagle_features_before=eagle_features_before,
+                    eagle_features_after=eagle_features,
+                    attn_weights=diag_data["attn_weights"],
+                    fastguide_attns=diag_data["fastguide_attns"],
+                    depth_tokens=diag_data["depth_tokens"],
+                    rgb_pixels=pixel_values,
+                    is_training=self.training,
+                )
+                self._diagnostics.report(self._depth_fwd_count, is_training=self.training)
+            else:
+                eagle_features = self.chnet(
+                    depth=depth_normalized,
+                    vit_features=vit_feats,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    eagle_features=eagle_features,
+                )
+
+            # Safety checks (always active, regardless of diagnostics)
             diff = (eagle_features - eagle_features_before).abs()
             diff_norm = diff.norm().item()
-            all_zero = eagle_features.abs().max().item() == 0.0
-            unchanged = diff_norm == 0.0
-
-            if all_zero:
+            if eagle_features.abs().max().item() == 0.0:
                 raise RuntimeError(
                     "[GROOT] CHNet output is all zeros! Cross-attention fusion produced empty features."
                 )
-            if unchanged:
+            if diff_norm == 0.0:
                 raise RuntimeError(
                     "[GROOT] CHNet did not change eagle_features at all! "
                     "Cross-attention residual is zero — depth signal is not being fused."
                 )
-
-            if self._depth_fwd_count <= 3 or self._depth_fwd_count % 5000 == 0:
-                mode = "TRAIN" if self.training else "EVAL"
-                ratio = diff_norm / eagle_features_before.norm().item()
-                print(f"[GROOT CHNet VERIFY] [{mode}] fwd #{self._depth_fwd_count}: "
-                      f"diff_norm={diff_norm:.4f}, "
-                      f"before_norm={eagle_features_before.norm().item():.4f}, "
-                      f"after_norm={eagle_features.norm().item():.4f}, "
-                      f"change_ratio={ratio:.6f}",
-                      flush=True)
 
         eagle_features = self.eagle_linear(eagle_features)
         return eagle_features, eagle_input["attention_mask"]
