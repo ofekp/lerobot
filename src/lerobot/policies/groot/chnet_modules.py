@@ -68,13 +68,15 @@ class FastGuide(nn.Module):
         self.conv2 = Basic2d(channels, channels, kernel_size=1, padding=0)
         self.conv3 = Basic2d(channels, channels, kernel_size=3, padding=1)
 
-    def forward(self, depth_feat, rgb_feat):
+    def forward(self, depth_feat, rgb_feat, return_diagnostics=False):
         """
         Args:
             depth_feat: (B, C, H, W) depth features from CNN encoder
             rgb_feat: (B, C, H, W) RGB features from ViT (projected + resized)
+            return_diagnostics: if True, also return spatial attention map
         Returns:
             (B, C, H, W) guided depth features
+            If return_diagnostics: tuple of (guided_features, avg_attn)
         """
         weight = self.conv1(rgb_feat)
         weight = self.weight_expansion(weight)  # (B, 3*C, H, W)
@@ -85,6 +87,8 @@ class FastGuide(nn.Module):
 
         avg_attn = weight.mean(dim=1, keepdim=True)  # (B, 1, H, W)
         out = self.conv3(out * avg_attn)
+        if return_diagnostics:
+            return out, avg_attn
         return out
 
 
@@ -166,33 +170,54 @@ class DepthCNNEncoder(nn.Module):
 
         self.out_channels = c3
 
-    def forward(self, depth, vit_features, grid_h, grid_w):
+    def forward(self, depth, vit_features, grid_h, grid_w, return_diagnostics=False):
         """
         Args:
             depth: (B, 1, H, W) normalized depth image
             vit_features: list of 4 tensors, each (B, N, D) from ViT layers
             grid_h, grid_w: ViT patch grid dimensions
+            return_diagnostics: if True, also return FastGuide spatial attention maps
         Returns:
             (B, out_channels, 7, 7) depth feature map
+            If return_diagnostics: tuple of (depth_features, fastguide_attns)
         """
+        fastguide_attns = [] if return_diagnostics else None
         x = self.stem(depth)
 
         x = self.stage1(x)
         rgb1 = self.proj1(vit_features[0], grid_h, grid_w)
-        x = self.guide1(x, rgb1)
+        if return_diagnostics:
+            x, attn = self.guide1(x, rgb1, return_diagnostics=True)
+            fastguide_attns.append(attn)
+        else:
+            x = self.guide1(x, rgb1)
 
         x = self.stage2(x)
         rgb2 = self.proj2(vit_features[1], grid_h, grid_w)
-        x = self.guide2(x, rgb2)
+        if return_diagnostics:
+            x, attn = self.guide2(x, rgb2, return_diagnostics=True)
+            fastguide_attns.append(attn)
+        else:
+            x = self.guide2(x, rgb2)
 
         x = self.stage3(x)
         rgb3 = self.proj3(vit_features[2], grid_h, grid_w)
-        x = self.guide3(x, rgb3)
+        if return_diagnostics:
+            x, attn = self.guide3(x, rgb3, return_diagnostics=True)
+            fastguide_attns.append(attn)
+        else:
+            x = self.guide3(x, rgb3)
 
         x = self.stage4(x)
         rgb4 = self.proj4(vit_features[3], grid_h, grid_w)
-        x = self.guide4(x, rgb4)
+        if return_diagnostics:
+            x, attn = self.guide4(x, rgb4, return_diagnostics=True)
+            fastguide_attns.append(attn)
+        else:
+            x = self.guide4(x, rgb4)
 
+        if return_diagnostics:
+            return x, fastguide_attns
         return x
 
 
@@ -207,13 +232,15 @@ class DepthCrossAttentionFusion(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, eagle_features, depth_features):
+    def forward(self, eagle_features, depth_features, return_diagnostics=False):
         """
         Args:
             eagle_features: (B, seq_len, hidden_dim) from Eagle model
             depth_features: (N, C, H, W) from DepthCNNEncoder, where N = B * num_views
+            return_diagnostics: if True, also return attention weights and depth tokens
         Returns:
             (B, seq_len, hidden_dim) enriched features
+            If return_diagnostics: tuple of (enriched_features, attn_weights, depth_tokens)
         """
         n, c, h, w = depth_features.shape
         b_eagle = eagle_features.shape[0]
@@ -229,12 +256,23 @@ class DepthCrossAttentionFusion(nn.Module):
             depth_tokens = depth_tokens.view(b_eagle, num_views * tokens_per_view, -1)
 
         # Cross-attention: Q=eagle, K=depth, V=depth
-        attn_out, _ = self.cross_attn(
-            query=eagle_features,
-            key=depth_tokens,
-            value=depth_tokens,
-        )
-        return self.norm(eagle_features + attn_out)
+        if return_diagnostics:
+            attn_out, attn_weights = self.cross_attn(
+                query=eagle_features,
+                key=depth_tokens,
+                value=depth_tokens,
+                need_weights=True,
+                average_attn_weights=False,  # keep per-head weights
+            )
+            result = self.norm(eagle_features + attn_out)
+            return result, attn_weights, depth_tokens
+        else:
+            attn_out, _ = self.cross_attn(
+                query=eagle_features,
+                key=depth_tokens,
+                value=depth_tokens,
+            )
+            return self.norm(eagle_features + attn_out)
 
 
 class CHNetDepthProcessor(nn.Module):
@@ -253,15 +291,30 @@ class CHNetDepthProcessor(nn.Module):
             num_heads=num_heads,
         )
 
-    def forward(self, depth, vit_features, grid_h, grid_w, eagle_features):
+    def forward(self, depth, vit_features, grid_h, grid_w, eagle_features, return_diagnostics=False):
         """
         Args:
             depth: (B, 1, H, W) normalized depth
             vit_features: list of 4 tensors from ViT intermediate layers
             grid_h, grid_w: ViT patch grid dimensions
             eagle_features: (B, seq_len, hidden_dim) pre-projection features
+            return_diagnostics: if True, also return intermediate tensors for visualization
         Returns:
             (B, seq_len, hidden_dim) enriched features
+            If return_diagnostics: tuple of (enriched_features, diagnostics_dict)
         """
-        depth_feat = self.encoder(depth, vit_features, grid_h, grid_w)
-        return self.fusion(eagle_features, depth_feat)
+        if return_diagnostics:
+            depth_feat, fastguide_attns = self.encoder(
+                depth, vit_features, grid_h, grid_w, return_diagnostics=True
+            )
+            result, attn_weights, depth_tokens = self.fusion(
+                eagle_features, depth_feat, return_diagnostics=True
+            )
+            return result, {
+                "attn_weights": attn_weights,
+                "fastguide_attns": fastguide_attns,
+                "depth_tokens": depth_tokens,
+            }
+        else:
+            depth_feat = self.encoder(depth, vit_features, grid_h, grid_w)
+            return self.fusion(eagle_features, depth_feat)
