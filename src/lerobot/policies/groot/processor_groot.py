@@ -845,6 +845,12 @@ class GrootEagleCollateStep(ProcessorStep):
     depth_scale: float = 1.0   # Data is already in meters from dataset loader
     depth_mean: float = 0.0    # No centering — keep metric values
     depth_std: float = 1.0     # No rescaling — keep metric values
+    # Set depth_scale based on your depth units: 1/1000 for mm, 1/10 for m (to get ~[0,1] range)
+    depth_scale: float = 0.001  # Default assumes depth in mm, converts to meters
+    depth_mean: float = 0.5  # Center depth around 0 after scaling
+    depth_std: float = 0.5   # Scale to roughly match RGB normalized range
+    # Directory for saving diagnostic observation mosaic (from CLI --output_dir)
+    debug_dir: str = None
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
     _saved_mosaic: bool = field(default=False, init=False, repr=False)
 
