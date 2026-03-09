@@ -120,7 +120,7 @@ class DepthDiagnostics:
     # ------------------------------------------------------------------
     def _snapshot_initial_weights(self):
         """Snapshot L2 norms of CHNet sub-module weights at init."""
-        backbone = self.model.backbone
+        backbone = self.model
         if backbone.chnet is None:
             return
         for name, param in backbone.chnet.named_parameters():
@@ -136,7 +136,7 @@ class DepthDiagnostics:
         self._startup_printed = True
 
         git_hash, git_branch = _git_info()
-        backbone = self.model.backbone
+        backbone = self.model
         chnet = backbone.chnet
 
         lines = []
@@ -351,7 +351,7 @@ class DepthDiagnostics:
             lines.append("  depth_input       : NOT PROVIDED")
 
         # 2. Weight norms
-        backbone = self.model.backbone
+        backbone = self.model
         chnet = backbone.chnet
         if chnet is not None:
             lines.append("  --- CHNet Weight Norms ---")
