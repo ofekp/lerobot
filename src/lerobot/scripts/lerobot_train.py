@@ -127,6 +127,13 @@ def update_policy(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
 
+    # Log CHNet gradient norms before they are zeroed (diagnostics)
+    _unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    if hasattr(_unwrapped, "_diagnostics") and _unwrapped._diagnostics is not None:
+        # step count is tracked internally by the diagnostics module via _depth_fwd_count
+        _fwd_count = getattr(_unwrapped._groot_model.backbone, '_depth_fwd_count', 0)
+        _unwrapped._diagnostics.log_gradients(_fwd_count, _unwrapped._groot_model.backbone)
+
     # Optimizer step
     with lock if lock is not None else nullcontext():
         optimizer.step()
@@ -427,6 +434,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    # Initialize depth diagnostics automatically if policy supports it
+    unwrapped_policy = accelerator.unwrap_model(policy) if hasattr(accelerator, 'unwrap_model') else policy
+    if hasattr(unwrapped_policy, "init_diagnostics"):
+        camera_names = [k for k in dataset.meta.features if "image" in k and "depth" not in k]
+        unwrapped_policy.init_diagnostics(
+            output_dir=cfg.output_dir,
+            dataset_info={"camera_names": camera_names},
+        )
+
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
@@ -506,6 +522,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # increment `step` here.
         step += 1
         train_tracker.step()
+
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
