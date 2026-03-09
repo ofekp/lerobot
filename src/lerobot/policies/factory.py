@@ -250,6 +250,7 @@ def make_pre_post_processors(
                 "depth_scale": getattr(policy_cfg, "depth_scale", 1.0),
                 "depth_mean": getattr(policy_cfg, "depth_mean", 0.0),
                 "depth_std": getattr(policy_cfg, "depth_std", 1.0),
+                "debug_dir": getattr(policy_cfg, "debug_dir", None),
             }
 
             # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats

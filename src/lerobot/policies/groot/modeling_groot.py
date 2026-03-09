@@ -38,6 +38,8 @@ from collections import deque
 import torch
 from torch import Tensor
 
+import logging
+
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.groot.groot_n1 import GR00TN15
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -175,6 +177,31 @@ class GrootPolicy(PreTrainedPolicy):
             actions = self.predict_action_chunk(batch)
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
+
+    def verify_architecture(self) -> None:
+        """Verify GR00T model architecture matches config expectations.
+
+        Checks:
+          - Patch embedding input channels == 4 if use_depth else 3.
+        """
+        expected_channels = 4 if self.config.use_depth else 3
+        patch_key = (
+            "_groot_model.backbone.eagle_model.vision_model."
+            "vision_model.embeddings.patch_embedding.weight"
+        )
+        patch_weight = self.state_dict().get(patch_key)
+        assert patch_weight is not None, (
+            f"[GROOT] verify_architecture FAILED: key '{patch_key}' not found in state_dict."
+        )
+        actual_channels = patch_weight.shape[1]
+        assert actual_channels == expected_channels, (
+            f"[GROOT] verify_architecture FAILED: patch_embedding has {actual_channels} input "
+            f"channel(s) but expected {expected_channels} (use_depth={self.config.use_depth})."
+        )
+        logging.info(
+            f"[GROOT] verify_architecture OK: patch_embedding input channels = {actual_channels} "
+            f"(use_depth={self.config.use_depth})"
+        )
 
     # -------------------------
     # Internal helpers

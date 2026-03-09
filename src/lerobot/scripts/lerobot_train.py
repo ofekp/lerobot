@@ -19,6 +19,7 @@ import time
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
+from pathlib import Path
 
 import torch
 from accelerate import Accelerator
@@ -329,6 +330,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+    
+    # Experiment-specific architecture verification (e.g. patch embedding channels for depth).
+    # Base PreTrainedPolicy.verify_architecture() is a no-op; only overridden policies do real checks.
+    policy.verify_architecture()
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
@@ -340,6 +345,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}
+
+    # Propagate the training output_dir to the policy config so the diagnostic
+    # observation mosaic is saved to {output_dir}/debug/.
+    if hasattr(cfg.policy, "output_dir"):
+        cfg.policy.debug_dir = str(Path(cfg.output_dir) / "debug")
+
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats

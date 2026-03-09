@@ -14,13 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from einops import rearrange
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -90,7 +92,6 @@ def make_groot_pre_post_processors(
     Returns:
         Tuple of (preprocessor, postprocessor) pipelines
     """
-
     # Get horizon/dimension parameters from config
     # These should match the config used for the pretrained model
     # Default values match most GR00T configs (state_horizon=1, action_horizon=16)
@@ -154,6 +155,7 @@ def make_groot_pre_post_processors(
             depth_scale=getattr(config, 'depth_scale', 0.001),
             depth_mean=getattr(config, 'depth_mean', 0.5),
             depth_std=getattr(config, 'depth_std', 0.5),
+            debug_dir=getattr(config, 'debug_dir', None),
         ),
         # 6. Move to device
         DeviceProcessorStep(device=config.device),
@@ -244,6 +246,162 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
     return proc
 
 
+def save_observation_mosaic(
+    rgb_pixel_values: torch.Tensor,
+    num_views: int,
+    img_keys: list[str],
+    debug_dir: str,
+    mode: str = "unknown",
+    depth_pixel_values: torch.Tensor | None = None,
+    depth_keys: list[str | None] | None = None,
+    depth_scale: float = 1.0,
+    depth_mean: float = 0.0,
+    depth_std: float = 1.0,
+) -> None:
+    """Save a diagnostic mosaic of the *final* processed observations fed to the model.
+
+    Called after Eagle collate + depth fusion — the tensors visualised here are
+    **exactly** what enters the GR00T backbone (the next step is only
+    ``DeviceProcessorStep`` which moves tensors to GPU without changing values).
+
+    Each panel is one camera view.  RGB channels are de-normalised from Eagle
+    format (mean=0.5, std=0.5).  If ``depth_pixel_values`` is provided, each
+    depth view is shown alongside its RGB counterpart.
+
+    Images are flipped vertically before saving.
+
+    For **train** mode the mosaic is saved to ``output_dir/debug/``.
+    For **eval** mode it is saved to ``output_dir/../debug/`` so that both
+    mosaics sit in the same parent debug folder.
+
+    Args:
+        rgb_pixel_values: ``(N, 3, H, W)`` — Eagle-normalised RGB. N = B*V.
+        num_views: Number of camera views per sample (V).
+        img_keys: Observation key names for the RGB cameras.
+        output_dir: Top-level output directory (``--output_dir`` from CLI).
+        mode: ``"train"`` or ``"eval"`` — included in the filename.
+        depth_pixel_values: Optional ``(N, 1, H, W)`` normalised depth.
+        depth_keys: Observation key names for the depth cameras (may contain None).
+        depth_scale: Scale used during depth normalisation (for de-normalisation).
+        depth_mean: Mean used during depth normalisation.
+        depth_std: Std used during depth normalisation.
+    """
+    LABEL_HEIGHT = 48  # tall enough for two lines of text
+    PADDING = 4
+
+    panels: list[tuple[str, Image.Image]] = []
+
+    # First ``num_views`` tiles belong to batch-element 0's camera views.
+    for v in range(min(num_views, rgb_pixel_values.shape[0])):
+        rgb = rgb_pixel_values[v].cpu().float()  # (3, H, W)
+
+        # --- RGB: undo Eagle normalisation (mean=0.5, std=0.5) ---
+        rgb = rgb * 0.5 + 0.5
+        rgb = rgb.clamp(0, 1)
+        rgb_np = (rgb.permute(1, 2, 0).numpy() * 255).astype(np.uint8)  # (H,W,3)
+        rgb_np = np.flipud(rgb_np).copy()
+        key = img_keys[v] if v < len(img_keys) else f"camera_{v}"
+        panels.append((key, Image.fromarray(rgb_np)))
+
+        # --- Depth (separate tensor) ---
+        if depth_pixel_values is not None and v < depth_pixel_values.shape[0]:
+            depth_norm = depth_pixel_values[v, 0].cpu().float()  # (H, W)
+            # Undo normalisation: raw = (normalised * std + mean) / scale
+            if depth_scale != 0:
+                depth_raw = (depth_norm * depth_std + depth_mean) / depth_scale
+            else:
+                depth_raw = depth_norm
+            depth_raw_np = np.flipud(depth_raw.numpy()).copy()
+
+            d_min, d_max = float(depth_raw_np.min()), float(depth_raw_np.max())
+            if d_max - d_min > 1e-6:
+                depth_vis = ((depth_raw_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+            else:
+                depth_vis = np.zeros_like(depth_raw_np, dtype=np.uint8)
+            depth_rgb = np.stack([depth_vis] * 3, axis=-1)
+
+            d_key = (depth_keys[v] if depth_keys and v < len(depth_keys) else None) or f"depth_{v}"
+            # Multi-line label: key, range, norm params
+            label = (
+                f"{d_key}\n"
+                f"[{d_min:.3f} \u2013 {d_max:.3f}m]\n"
+                f"norm \u03bc={depth_mean} \u03c3={depth_std}"
+            )
+            panels.append((label, Image.fromarray(depth_rgb)))
+
+    if not panels:
+        logging.warning("[GROOT] No image panels to save in observation mosaic.")
+        return
+
+    cell_w = max(p.size[0] for _, p in panels)
+    cell_h = max(p.size[1] for _, p in panels)
+    n = len(panels)
+    mosaic_w = n * cell_w + (n - 1) * PADDING
+    mosaic_h = LABEL_HEIGHT + cell_h
+
+    mosaic = Image.new("RGB", (mosaic_w, mosaic_h), color=(0, 0, 0))
+    draw = ImageDraw.Draw(mosaic)
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 11)
+    except (OSError, IOError):
+        font = ImageFont.load_default()
+
+    for idx, (label, img) in enumerate(panels):
+        x_off = idx * (cell_w + PADDING)
+        # draw.text handles embedded \n for multi-line labels
+        draw.text((x_off + 2, 2), label, fill=(255, 255, 255), font=font)
+        mosaic.paste(img, (x_off, LABEL_HEIGHT))
+
+    os.makedirs(debug_dir, exist_ok=True)
+    save_path = os.path.join(debug_dir, f"observation_mosaic_{mode}.png")
+    mosaic.save(save_path)
+    logging.info(f"[GROOT] Saved observation mosaic ({n} panels, mode={mode}) to: {save_path}")
+
+
+def save_eagle_processor_config(
+    proc: ProcessorMixin,
+    debug_dir: str,
+    mode: str,
+    depth_scale: float,
+    depth_mean: float,
+    depth_std: float,
+) -> None:
+    """Dump the Eagle processor configuration to a text file in the debug folder.
+
+    This captures normalisation settings (image_mean, image_std, rescale_factor,
+    etc.) that wouldn't be visible from the observation mosaic alone.
+    """
+    os.makedirs(debug_dir, exist_ok=True)
+    save_path = os.path.join(debug_dir, f"eagle_processor_config_{mode}.txt")
+
+    lines: list[str] = []
+    lines.append(f"Processor type: {type(proc).__name__}")
+    if hasattr(proc, 'image_processor'):
+        img_proc = proc.image_processor
+        lines.append(f"Image processor type: {type(img_proc).__name__}")
+        for attr in [
+            'do_convert_rgb', 'do_normalize', 'do_rescale', 'do_resize',
+            'image_mean', 'image_std', 'rescale_factor', 'size',
+            'data_format', 'tokens_per_tile', 'use_thumbnail',
+            'min_dynamic_tiles', 'max_dynamic_tiles',
+        ]:
+            if hasattr(img_proc, attr):
+                lines.append(f"  {attr}: {getattr(img_proc, attr)}")
+    if hasattr(proc, 'tokenizer'):
+        tok = proc.tokenizer
+        lines.append(f"Tokenizer type: {type(tok).__name__}")
+        lines.append(f"  padding_side: {getattr(tok, 'padding_side', 'N/A')}")
+    lines.append(f"\nDepth normalisation:")
+    lines.append(f"  depth_scale: {depth_scale}")
+    lines.append(f"  depth_mean: {depth_mean}")
+    lines.append(f"  depth_std: {depth_std}")
+
+    with open(save_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    logging.info(f"[GROOT] Saved Eagle processor config (mode={mode}) to: {save_path}")
+
+
 @dataclass
 @ProcessorStepRegistry.register(name="groot_pack_inputs_v3")
 class GrootPackInputsStep(ProcessorStep):
@@ -316,6 +474,10 @@ class GrootPackInputsStep(ProcessorStep):
             cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]  # List of (B, H, W, 3)
             b, h, w, _ = cams[0].shape  # Get spatial dims from first camera
             
+            # These will be populated if use_depth is True
+            depth_keys: list[str | None] | None = None
+            depth_tensors: list[torch.Tensor] | None = None
+
             # Handle depth: keep separate for late fusion (after Eagle RGB processing)
             if self.use_depth:
                 # Find depth images based on the img_keys
@@ -347,7 +509,14 @@ class GrootPackInputsStep(ProcessorStep):
                 depth_stacked = torch.stack(depth_tensors, dim=1)  # (B, V, 1, H, W)
                 depth_stacked = depth_stacked.unsqueeze(1)  # (B, 1, V, 1, H, W) to match video T dim
                 obs["depth_raw"] = depth_stacked  # Keep for late fusion
-                    
+
+            # Pass key names downstream for the diagnostic observation mosaic
+            # (saved in GrootEagleCollateStep after eagle_pixel_values is finalised)
+            comp["_mosaic_img_keys"] = img_keys
+            if depth_keys is not None:
+                comp["_mosaic_depth_keys"] = depth_keys
+            comp["_mosaic_num_views"] = len(img_keys)
+
             # Create RGB-only video (depth will be concatenated after Eagle processing)
             video = np.stack(cams, axis=1)  # (B, V, H, W, 3)
             video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, 3)
@@ -674,9 +843,10 @@ class GrootEagleCollateStep(ProcessorStep):
     depth_scale: float = 0.001  # Default assumes depth in mm, converts to meters
     depth_mean: float = 0.5  # Center depth around 0 after scaling
     depth_std: float = 0.5   # Scale to roughly match RGB normalized range
+    # Directory for saving diagnostic observation mosaic (from CLI --output_dir)
+    debug_dir: str = None
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
-    _logged_first_depth: bool = field(default=False, init=False, repr=False)
-    _logged_first_rgb: bool = field(default=False, init=False, repr=False)
+    _saved_mosaic: bool = field(default=False, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
@@ -739,115 +909,51 @@ class GrootEagleCollateStep(ProcessorStep):
             pixel_values_rgbd = torch.cat([pixel_values, depth_normalized], dim=1)
             comp["eagle_pixel_values"] = pixel_values_rgbd
             
-            # Log depth stats for first frame only (deterministic, for comparison between runs)
-            if not self._logged_first_depth:
-                self._logged_first_depth = True
-                # First frame of first batch element
-                first_depth_raw = depth_flat[0, 0]  # RAW depth before normalization
-                first_depth = depth_normalized[0, 0]  # (H', W')
-                first_rgb = pixel_values[0]  # (3, H', W')
-                
-                # Check for suspicious patterns (all rows identical = likely bug)
-                unique_rows = torch.unique(first_depth_raw, dim=0).shape[0]
-                unique_cols = torch.unique(first_depth_raw, dim=1).shape[0]
-                
-                print(f"[GROOT DEPTH DEBUG RAW] Before normalization:")
-                print(f"  Shape: {first_depth_raw.shape}")
-                print(f"  Min: {first_depth_raw.min().item():.6f}, Max: {first_depth_raw.max().item():.6f}")
-                print(f"  Mean: {first_depth_raw.mean().item():.6f}, Std: {first_depth_raw.std().item():.6f}")
-                print(f"  Unique rows: {unique_rows}/{first_depth_raw.shape[0]}, Unique cols: {unique_cols}/{first_depth_raw.shape[1]}")
-                print(f"  Corner samples: TL={first_depth_raw[0,0].item():.6f}, TR={first_depth_raw[0,-1].item():.6f}, BL={first_depth_raw[-1,0].item():.6f}, BR={first_depth_raw[-1,-1].item():.6f}")
-                if unique_rows < 10:
-                    print(f"  WARNING: Only {unique_rows} unique rows - depth image may be corrupted!")
-
-                print(first_depth)
-
-                print(f"[GROOT DEPTH DEBUG] First frame depth stats (normalized, before network):")
-                print(f"  Shape: {first_depth.shape}")
-                print(f"  Min: {first_depth.min().item():.6f}, Max: {first_depth.max().item():.6f}")
-                print(f"  Mean: {first_depth.mean().item():.6f}, Std: {first_depth.std().item():.6f}")
-                print(f"  Sample values [0,0]: {first_depth[0,0].item():.6f}, [H//2,W//2]: {first_depth[first_depth.shape[0]//2, first_depth.shape[1]//2].item():.6f}")
-                print(f"  RGB channel means: R={first_rgb[0].mean().item():.4f}, G={first_rgb[1].mean().item():.4f}, B={first_rgb[2].mean().item():.4f}")
-                
-                # Save depth and RGB images for visual comparison between train and eval
-                try:
-                    import os
-                    from PIL import Image as PILImage
-                    
-                    # Determine if this is training or eval based on model mode
-                    # During training, self.training would be True on the model, but we don't have direct access
-                    # Use a heuristic: check if we're in output_rgb or output_rgbd folder context
-                    mode_suffix = "unknown"
-                    # Try to detect from environment or just use timestamp to make unique
-                    import time
-                    timestamp = int(time.time())
-                    
-                    output_dir = "./output"
-                    os.makedirs(output_dir, exist_ok=True)
-                    
-                    # Save RAW depth (before normalization) - in meters, normalize to 0-255 for visualization
-                    depth_vis = first_depth_raw.cpu().numpy()
-                    # Clip to 0-5m range and normalize to 0-255
-                    depth_vis_clipped = np.clip(depth_vis, 0, 5.0)
-                    depth_vis_uint8 = (depth_vis_clipped / 5.0 * 255).astype(np.uint8)
-                    depth_img = PILImage.fromarray(depth_vis_uint8, mode='L')
-                    depth_path = os.path.join(output_dir, f"debug_depth_raw_{timestamp}.png")
-                    depth_img.save(depth_path)
-                    print(f"  [DEBUG] Saved raw depth image to: {depth_path}")
-                    
-                    # Save normalized depth
-                    depth_norm_vis = first_depth.cpu().numpy()
-                    # Normalized depth is roughly in [-2, 2] range, map to 0-255
-                    depth_norm_clipped = np.clip((depth_norm_vis + 2.0) / 4.0, 0, 1)
-                    depth_norm_uint8 = (depth_norm_clipped * 255).astype(np.uint8)
-                    depth_norm_img = PILImage.fromarray(depth_norm_uint8, mode='L')
-                    depth_norm_path = os.path.join(output_dir, f"debug_depth_normalized_{timestamp}.png")
-                    depth_norm_img.save(depth_norm_path)
-                    print(f"  [DEBUG] Saved normalized depth image to: {depth_norm_path}")
-                    
-                    # Save RGB image
-                    rgb_vis = first_rgb.cpu().numpy()  # (3, H, W)
-                    # RGB is normalized with ImageNet stats, denormalize: x * std + mean
-                    # ImageNet: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                    # But Eagle uses mean=0.5, std=0.5
-                    rgb_denorm = rgb_vis * 0.5 + 0.5  # Assuming Eagle normalization
-                    rgb_denorm = np.clip(rgb_denorm, 0, 1)
-                    rgb_uint8 = (rgb_denorm * 255).astype(np.uint8)
-                    rgb_uint8 = np.transpose(rgb_uint8, (1, 2, 0))  # (H, W, 3)
-                    rgb_img = PILImage.fromarray(rgb_uint8, mode='RGB')
-                    rgb_path = os.path.join(output_dir, f"debug_rgb_{timestamp}.png")
-                    rgb_img.save(rgb_path)
-                    print(f"  [DEBUG] Saved RGB image to: {rgb_path}")
-                    
-                except Exception as e:
-                    print(f"  [DEBUG] Failed to save debug images: {e}")
-                
-                # Log Eagle processor config for train vs eval comparison
-                print(f"\n[GROOT EAGLE PROCESSOR CONFIG]")
-                print(f"  Processor type: {type(self.proc).__name__}")
-                if hasattr(self.proc, 'image_processor'):
-                    img_proc = self.proc.image_processor
-                    print(f"  Image processor type: {type(img_proc).__name__}")
-                    # Print all config attributes
-                    for attr in ['do_convert_rgb', 'do_normalize', 'do_rescale', 'do_resize', 
-                                 'image_mean', 'image_std', 'rescale_factor', 'size',
-                                 'data_format', 'tokens_per_tile', 'use_thumbnail',
-                                 'min_dynamic_tiles', 'max_dynamic_tiles']:
-                        if hasattr(img_proc, attr):
-                            print(f"    {attr}: {getattr(img_proc, attr)}")
-                if hasattr(self.proc, 'tokenizer'):
-                    tok = self.proc.tokenizer
-                    print(f"  Tokenizer type: {type(tok).__name__}")
-                    print(f"    padding_side: {getattr(tok, 'padding_side', 'N/A')}")
-                print("")
-            
             # Clean up depth_raw
             obs.pop("depth_raw", None)
 
-        if not self._logged_first_rgb:
-            self._logged_first_rgb = True
-            print(f"rgb value at     (0, 0): {pixel_values[0][:, 0, 0]}")  # Print RGB values at (0,0)
-            print(f"rgb value at (223, 223): {pixel_values[0][:, -1, -1]}")  # Print RGB values at (224,224)
+        # --- Diagnostic observation mosaic (once, on first batch) ---
+        # This is the LAST preprocessing step before DeviceProcessorStep (GPU move).
+        # The eagle_pixel_values tensor shown here is EXACTLY what the GR00T backbone receives.
+        if not self._saved_mosaic:
+            self._saved_mosaic = True
+            # Detect train vs eval: training batches include action data
+            action_data = transition.get(TransitionKey.ACTION)
+            is_training = isinstance(action_data, torch.Tensor)
+            mode = "train" if is_training else "eval"
+            num_views = comp.pop("_mosaic_num_views", 1)
+            img_keys = comp.pop("_mosaic_img_keys", [])
+            depth_keys = comp.pop("_mosaic_depth_keys", None)
+
+            epv = comp["eagle_pixel_values"]  # (N, C, H, W)
+            rgb_pv = epv[:, :3]  # (N, 3, H, W)
+            depth_pv = epv[:, 3:4] if epv.shape[1] == 4 else None  # (N, 1, H, W) or None
+
+            save_observation_mosaic(
+                rgb_pixel_values=rgb_pv,
+                num_views=num_views,
+                img_keys=img_keys,
+                debug_dir=self.debug_dir,
+                mode=mode,
+                depth_pixel_values=depth_pv,
+                depth_keys=depth_keys,
+                depth_scale=self.depth_scale,
+                depth_mean=self.depth_mean,
+                depth_std=self.depth_std,
+            )
+            save_eagle_processor_config(
+                proc=self.proc,
+                debug_dir=self.debug_dir,
+                mode=mode,
+                depth_scale=self.depth_scale,
+                depth_mean=self.depth_mean,
+                depth_std=self.depth_std,
+            )
+        else:
+            # Clean up metadata keys on subsequent batches
+            comp.pop("_mosaic_num_views", None)
+            comp.pop("_mosaic_img_keys", None)
+            comp.pop("_mosaic_depth_keys", None)
         
         obs.pop(
             "video", None

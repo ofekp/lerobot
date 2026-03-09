@@ -556,6 +556,64 @@ def _compile_episode_data(
     return data_dict
 
 
+def _verify_loaded_weights(policy: PreTrainedPolicy, pretrained_path: str) -> None:
+    """Independently verify that every weight in model.safetensors was loaded correctly.
+
+    Loads the safetensors file from scratch (bypassing the normal loading code-
+    path entirely) and compares every tensor against the policy's live
+    ``state_dict()``.
+
+    Raises ``AssertionError`` if:
+      - A key in model.safetensors has no matching key in the model.
+      - A key in model.safetensors has values that differ from the model.
+    """
+    import os
+
+    from safetensors.torch import load_file
+
+    safetensors_path = os.path.join(pretrained_path, "model.safetensors")
+    if not os.path.exists(safetensors_path):
+        logging.warning(
+            f"[VERIFY] model.safetensors not found at {safetensors_path}, "
+            "skipping weight verification."
+        )
+        return
+
+    logging.info(f"[VERIFY] Verifying loaded weights against {safetensors_path}")
+
+    # Load checkpoint to CPU independently
+    checkpoint = load_file(safetensors_path, device="cpu")
+
+    # Get the live model state on CPU for comparison
+    model_state = {k: v.cpu() for k, v in policy.state_dict().items()}
+
+    # Check 1: every checkpoint key must exist in the model
+    missing_from_model = sorted(set(checkpoint.keys()) - set(model_state.keys()))
+    assert not missing_from_model, (
+        f"[VERIFY] FAILED: {len(missing_from_model)} key(s) from model.safetensors "
+        f"have no match in the model:\n" + "\n".join(missing_from_model[:30])
+    )
+
+    # Check 2: every matching key must have identical values
+    mismatched: list[str] = []
+    for key in checkpoint:
+        if not torch.equal(checkpoint[key], model_state[key]):
+            max_diff = (checkpoint[key].float() - model_state[key].float()).abs().max().item()
+            mismatched.append(
+                f"  {key}: max_diff={max_diff:.2e}, shape={checkpoint[key].shape}"
+            )
+
+    assert not mismatched, (
+        f"[VERIFY] FAILED: {len(mismatched)} key(s) differ between model.safetensors "
+        f"and the loaded model:\n" + "\n".join(mismatched[:30])
+    )
+
+    logging.info(
+        f"[VERIFY] OK — all {len(checkpoint)} weights from model.safetensors "
+        f"match the loaded model exactly."
+    )
+
+
 @parser.wrap()
 def eval_main(cfg: EvalPipelineConfig):
     logging.info(pformat(asdict(cfg)))
@@ -587,11 +645,29 @@ def eval_main(cfg: EvalPipelineConfig):
 
     policy.eval()
 
+    # Experiment-specific architecture verification (e.g. patch embedding channels for depth).
+    # Base PreTrainedPolicy.verify_architecture() is a no-op; only overridden policies do real checks.
+    policy.verify_architecture()
+
+    # ── Independent weight verification ──────────────────────────────────
+    # After the (complex) loading pipeline finishes, independently load the
+    # safetensors checkpoint and compare every tensor against the model's
+    # state_dict.  This catches silent misloads, key-mapping bugs, and
+    # partial loads that ``strict=False`` may hide.
+    # TODO(ofekp): this should support the other method of loading which is with --policy.path (and without specifying --policy.type)
+    assert cfg.policy.pretrained_path is not None, "Pretrained path must be provided for weight verification."
+    _verify_loaded_weights(policy, cfg.policy.pretrained_path)
+
     # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
     preprocessor_overrides = {
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
+
+    # Propagate eval output_dir to policy config so the diagnostic observation
+    # mosaic is saved to {output_dir}/../debug/ (parent of eval sub-dir).
+    if hasattr(cfg.policy, "debug_dir"):
+        cfg.policy.debug_dir = str(Path(cfg.output_dir).parent / "debug")
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,

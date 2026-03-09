@@ -55,6 +55,7 @@ class GrootConfig(PreTrainedConfig):
     # of Foundation Robot Policies for Cross-Embodiment Manipulation")
     # When enabled, depth images are concatenated with RGB to form RGB-D (4-channel) input
     use_depth: bool = False
+    debug_dir: str = None
 
     # Method to initialize the depth channel weights in the vision encoder
     # "rgb_average": Initialize as average of RGB channels (recommended from paper)
