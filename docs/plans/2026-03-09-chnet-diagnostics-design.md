@@ -185,6 +185,84 @@ class DepthDiagnostics:
         """Called after backward pass to log gradient norms. Called from training loop."""
 ```
 
+## Component 5: Embedding Arithmetic Visualizations (every 500 steps)
+
+Inspired by word2vec's "king - man + woman = queen" — apply embedding arithmetic to depth/RGB tokens to reveal what the model has learned about depth.
+
+### 5a. Depth Contribution Map (`depth_contribution_map.png`)
+
+**What:** `eagle_features_after_fusion[patch] - eagle_features_before_fusion[patch]` for each token, visualized as spatial magnitude map.
+
+**Implementation:** Compute L2 norm of the per-token delta, reshape to spatial grid, overlay on RGB.
+
+**Expect:** High magnitude near task-relevant objects (things being grasped, obstacles). Low on empty background.
+**Concern if:** Uniform magnitude (depth not discriminating spatially) or all near-zero.
+
+### 5b. Proximity Direction Projection (`proximity_direction.png`)
+
+**What:** Find a "proximity direction" in embedding space, then project all eagle tokens onto it.
+
+**Implementation:**
+1. Sort depth tokens by their input depth value (near vs far)
+2. Compute `direction = mean(depth_tokens[near]) - mean(depth_tokens[far])` (top/bottom quartile by depth value)
+3. Project each eagle token onto this direction: `score = dot(eagle_token, direction) / |direction|`
+4. Reshape scores to spatial grid, overlay on RGB with colormap
+
+**Expect:** High projection scores near objects/surfaces, low scores on distant background. Physically: "which parts of the scene does the model understand as close vs far?"
+**Concern if:** No correlation with actual depth values, or uniform scores.
+
+### 5c. Token Space PCA/t-SNE (`token_space_pca.png`)
+
+**What:** 2D projection of depth tokens and eagle tokens, colored by modality and depth value.
+
+**Implementation:**
+1. Concatenate depth_tokens and eagle_tokens (both after projection to same dim)
+2. Run PCA (fast, deterministic) to 2D
+3. Plot with: shape = modality (circle=eagle, triangle=depth), color = spatial position or depth value
+
+**Expect:** Some clustering by modality but with overlap in task-relevant regions. Depth tokens for near objects should be closer to corresponding eagle tokens.
+**Concern if:** Complete separation (modalities not interacting) or complete overlap (depth adds nothing distinctive).
+
+### 5d. Cross-Modal Nearest Neighbors (`nearest_neighbors.png`)
+
+**What:** For each depth token, find its nearest eagle token by cosine similarity. Draw arrows on spatial grid.
+
+**Implementation:**
+1. Compute cosine similarity matrix (depth_tokens x eagle_tokens)
+2. For each depth token, find argmax eagle token
+3. Draw arrows from depth patch location to eagle patch location on a spatial grid overlay
+
+**Expect:** Arrows mostly point to same or nearby spatial location (spatial correspondence preserved). Some arrows to distant but semantically related patches.
+**Concern if:** Random arrow directions (no spatial or semantic structure).
+
+### index.txt additions for embedding arithmetic
+
+```
+5. depth_contribution_map.png
+   WHAT: Per-token magnitude of (eagle_after_fusion - eagle_before_fusion), shown spatially.
+   HOW TO READ: Bright = depth changed this token a lot. Overlaid on RGB.
+   EXPECT: High on objects/surfaces, low on empty background.
+   CONCERN IF: Uniform or near-zero everywhere.
+
+6. proximity_direction.png
+   WHAT: Eagle tokens projected onto the near-far depth direction.
+   HOW TO READ: Red=model thinks "close", blue=model thinks "far". Compare with actual depth.
+   EXPECT: Should correlate with real depth values. Red near objects, blue on background.
+   CONCERN IF: No correlation with actual depth, or uniform.
+
+7. token_space_pca.png
+   WHAT: PCA of depth and eagle tokens in 2D. Circles=eagle, triangles=depth.
+   HOW TO READ: Color = depth value (near=warm, far=cool).
+   EXPECT: Some modality clustering with overlap at task-relevant regions.
+   CONCERN IF: Complete separation (no interaction) or complete overlap (depth redundant).
+
+8. nearest_neighbors.png
+   WHAT: Arrows from each depth patch to its most similar eagle patch.
+   HOW TO READ: Arrows show cross-modal alignment. Most should be short (same location).
+   EXPECT: Spatial correspondence — arrows mostly point to same/nearby locations.
+   CONCERN IF: Random directions (no learned correspondence).
+```
+
 ## Non-Goals (Explicitly Out of Scope)
 
 - No wandb/tensorboard integration (local directory only)
@@ -207,6 +285,10 @@ class DepthDiagnostics:
       fastguide_stage4.png
       embedding_similarity.png
       input_overlay.png
+      depth_contribution_map.png
+      proximity_direction.png
+      token_space_pca.png
+      nearest_neighbors.png
     step_1000/
       ...
     eval_episode_0/
