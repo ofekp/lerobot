@@ -97,6 +97,7 @@ class GrootPolicy(PreTrainedPolicy):
             tune_projector=self.config.tune_projector,
             tune_diffusion_model=self.config.tune_diffusion_model,
             use_depth=self.config.use_depth,
+            debug_dir=self.config.debug_dir,
             dgcnn_workspace_bounds=self.config.dgcnn_workspace_bounds,
             dgcnn_num_points=self.config.dgcnn_num_points,
             dgcnn_k=self.config.dgcnn_k,
@@ -122,7 +123,7 @@ class GrootPolicy(PreTrainedPolicy):
         Delegates to Isaac-GR00T model.forward when inputs are compatible.
         """
         # Build a clean input dict for GR00T: keep only tensors GR00T consumes
-        allowed_base = {"state", "state_mask", "action", "action_mask", "embodiment_id"}
+        allowed_base = {"state", "state_mask", "action", "action_mask", "embodiment_id", "depth_raw"}
         groot_inputs = {
             k: v
             for k, v in batch.items()
@@ -155,7 +156,7 @@ class GrootPolicy(PreTrainedPolicy):
         # Build a clean input dict for GR00T: keep only tensors GR00T consumes
         # Preprocessing is handled by the processor pipeline, so we just filter the batch
         # NOTE: During inference, we should NOT pass action/action_mask (that's what we're predicting)
-        allowed_base = {"state", "state_mask", "embodiment_id"}
+        allowed_base = {"state", "state_mask", "embodiment_id", "depth_raw"}
         groot_inputs = {
             k: v
             for k, v in batch.items()
@@ -187,29 +188,122 @@ class GrootPolicy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     def verify_architecture(self) -> None:
-        """Verify GR00T model architecture matches config expectations.
+        """Verify GR00T model architecture matches config expectations for DGCNN.
 
-        Checks:
-          - Patch embedding input channels == 4 if use_depth else 3.
+        When ``use_depth=True``, checks:
+          1. ``EagleBackbone.use_depth`` flag is set.
+          2. ``EagleBackbone.point_cloud_encoder`` exists and is a ``DGCNNEncoder``.
+          3. DGCNN hyperparams match config (num_points, k, num_tokens).
+          4. DGCNN ``hidden_dim`` matches the Eagle projection dim (``eagle_linear``
+             output) so that ``torch.cat([eagle_embeds, pc_tokens], dim=1)``
+             works at forward time.
+          5. DGCNN sub-modules (conv1-4, projection, norm) are present.
+          6. Patch embedding stays 3-channel (RGB only; depth goes through DGCNN).
+
+        When ``use_depth=False``, checks:
+          1. ``point_cloud_encoder`` is ``None``.
+          2. Patch embedding is 3-channel RGB.
         """
-        expected_channels = 4 if self.config.use_depth else 3
-        patch_key = (
-            "_groot_model.backbone.eagle_model.vision_model."
-            "vision_model.embeddings.patch_embedding.weight"
-        )
-        patch_weight = self.state_dict().get(patch_key)
-        assert patch_weight is not None, (
-            f"[GROOT] verify_architecture FAILED: key '{patch_key}' not found in state_dict."
-        )
-        actual_channels = patch_weight.shape[1]
-        assert actual_channels == expected_channels, (
-            f"[GROOT] verify_architecture FAILED: patch_embedding has {actual_channels} input "
-            f"channel(s) but expected {expected_channels} (use_depth={self.config.use_depth})."
-        )
-        logging.info(
-            f"[GROOT] verify_architecture OK: patch_embedding input channels = {actual_channels} "
-            f"(use_depth={self.config.use_depth})"
-        )
+        from lerobot.policies.groot.dgcnn_encoder import DGCNNEncoder
+
+        backbone = self._groot_model.backbone  # EagleBackbone
+        cfg = self.config
+
+        if cfg.use_depth:
+            # --- 1. Flag ---
+            assert getattr(backbone, "use_depth", False), (
+                "[GROOT] verify_architecture FAILED: config.use_depth=True but "
+                "EagleBackbone.use_depth is False."
+            )
+
+            # --- 2. Encoder exists and is the right type ---
+            pce = getattr(backbone, "point_cloud_encoder", None)
+            assert pce is not None, (
+                "[GROOT] verify_architecture FAILED: config.use_depth=True but "
+                "EagleBackbone.point_cloud_encoder is None."
+            )
+            assert isinstance(pce, DGCNNEncoder), (
+                f"[GROOT] verify_architecture FAILED: point_cloud_encoder is "
+                f"{type(pce).__name__}, expected DGCNNEncoder."
+            )
+
+            # --- 3. Hyperparams ---
+            assert pce.num_points == cfg.dgcnn_num_points, (
+                f"[GROOT] verify_architecture FAILED: DGCNN num_points={pce.num_points} "
+                f"!= config.dgcnn_num_points={cfg.dgcnn_num_points}."
+            )
+            assert pce.k == cfg.dgcnn_k, (
+                f"[GROOT] verify_architecture FAILED: DGCNN k={pce.k} "
+                f"!= config.dgcnn_k={cfg.dgcnn_k}."
+            )
+            assert pce.num_tokens == cfg.dgcnn_num_tokens, (
+                f"[GROOT] verify_architecture FAILED: DGCNN num_tokens={pce.num_tokens} "
+                f"!= config.dgcnn_num_tokens={cfg.dgcnn_num_tokens}."
+            )
+
+            # --- 4. Hidden dim matches Eagle projection output ---
+            eagle_linear = backbone.eagle_linear
+            if hasattr(eagle_linear, "out_features"):
+                eagle_out_dim = eagle_linear.out_features
+            else:
+                # nn.Identity — output size is the raw Eagle hidden size (2048)
+                eagle_out_dim = 2048
+            assert pce.hidden_dim == eagle_out_dim, (
+                f"[GROOT] verify_architecture FAILED: DGCNN hidden_dim={pce.hidden_dim} "
+                f"!= Eagle projection output dim={eagle_out_dim}. "
+                f"Tokens cannot be concatenated."
+            )
+
+            # --- 5. Sub-modules ---
+            for name in ("conv1", "conv2", "conv3", "conv4", "projection", "norm"):
+                assert hasattr(pce, name), (
+                    f"[GROOT] verify_architecture FAILED: DGCNNEncoder missing "
+                    f"sub-module '{name}'."
+                )
+
+            # --- 6. Patch embedding stays 3-channel (RGB only) ---
+            patch_key = (
+                "_groot_model.backbone.eagle_model.vision_model."
+                "vision_model.embeddings.patch_embedding.weight"
+            )
+            patch_weight = self.state_dict().get(patch_key)
+            if patch_weight is not None:
+                assert patch_weight.shape[1] == 3, (
+                    f"[GROOT] verify_architecture FAILED: use_depth=True (DGCNN mode) "
+                    f"but patch_embedding has {patch_weight.shape[1]} channels instead "
+                    f"of 3. Depth should go through DGCNN, not the patch embedding."
+                )
+
+            n_params = sum(p.numel() for p in pce.parameters())
+            logging.info(
+                f"[GROOT] verify_architecture OK (use_depth=True): "
+                f"DGCNNEncoder({pce.num_points} pts, k={pce.k}, "
+                f"{pce.num_tokens} tokens, hidden={pce.hidden_dim}, "
+                f"{n_params:,} params) → concat with Eagle ({eagle_out_dim}-d)"
+            )
+        else:
+            # --- depth disabled: encoder must be absent ---
+            pce = getattr(backbone, "point_cloud_encoder", None)
+            assert pce is None, (
+                "[GROOT] verify_architecture FAILED: config.use_depth=False but "
+                f"EagleBackbone.point_cloud_encoder is {type(pce).__name__} (should be None)."
+            )
+
+            patch_key = (
+                "_groot_model.backbone.eagle_model.vision_model."
+                "vision_model.embeddings.patch_embedding.weight"
+            )
+            patch_weight = self.state_dict().get(patch_key)
+            if patch_weight is not None:
+                assert patch_weight.shape[1] == 3, (
+                    f"[GROOT] verify_architecture FAILED: patch_embedding has "
+                    f"{patch_weight.shape[1]} channels, expected 3 (RGB)."
+                )
+
+            logging.info(
+                "[GROOT] verify_architecture OK (use_depth=False): "
+                "no DGCNN encoder, patch_embedding=3ch RGB"
+            )
 
     # -------------------------
     # Internal helpers

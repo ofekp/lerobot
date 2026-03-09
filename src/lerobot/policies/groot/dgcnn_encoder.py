@@ -249,6 +249,7 @@ class DGCNNEncoder(nn.Module):
             (1.0, 3.5),
         ),
         camera_weights: str | None = None,
+        debug_dir: str | None = None,
     ) -> None:
         super().__init__()
         self.num_points = num_points
@@ -256,6 +257,7 @@ class DGCNNEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_tokens = num_tokens
         self.workspace_bounds = workspace_bounds
+        self.debug_dir = debug_dir
 
         # Parse camera weights: "front:30,wrist:70" -> {"front": 0.3, "wrist": 0.7}
         self.camera_weight_map: dict[str, float] | None = None
@@ -285,6 +287,10 @@ class DGCNNEncoder(nn.Module):
         # Concatenated features from all layers: 64 + 128 + 256 + 512 = 960
         self.projection = nn.Linear(960, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
+
+        # Debug visualization state (set externally after construction)
+        self._saved_first_batch_train: bool = False
+        self._saved_first_batch_eval: bool = False
 
         # Cache slot for the most recent point cloud (used by eval rendering)
         self._last_point_cloud = None
@@ -369,21 +375,16 @@ class DGCNNEncoder(nn.Module):
                 )
 
         # ----------------------------------------------------------
-        # 2. Filter to workspace bounds
+        # 2. Filter to workspace bounds (DISABLED — using depth validity only)
         # ----------------------------------------------------------
-        bounds = self._bounds.to(dtype=points.dtype)  # (3, 2)
-        lo = bounds[:, 0]  # (3,)
-        hi = bounds[:, 1]  # (3,)
-
-        in_bounds = (
-            (points[..., 0] >= lo[0]) & (points[..., 0] <= hi[0])
-            & (points[..., 1] >= lo[1]) & (points[..., 1] <= hi[1])
-            & (points[..., 2] >= lo[2]) & (points[..., 2] <= hi[2])
-        )  # (B, N)
-        mask = valid & in_bounds  # (B, N)
+        # TODO: Re-enable workspace bounds filtering once bounds are properly
+        # calibrated for the target environment.  For now, relying solely on
+        # the depth validity mask (0.01–10.0 m) avoids accidentally discarding
+        # all points due to incorrect bounds.
+        mask = valid  # (B, N)
 
         assert mask.any(), (
-            f"No 3D points survived workspace filtering — check depth values and bounds {self._bounds}"
+            "No valid 3D points — all depth values outside [0.01, 10.0] metres"
         )
 
         # ----------------------------------------------------------
@@ -453,96 +454,205 @@ class DGCNNEncoder(nn.Module):
         )
 
         # ----------------------------------------------------------
-        # 7. Cache point cloud for visualization
+        # 7. Cache point cloud & save diagnostic HTML (first batch only)
         # ----------------------------------------------------------
         self._last_point_cloud = sampled_points[0].detach().cpu()
         global _point_cloud_cache
         _point_cloud_cache = self._last_point_cloud
 
+        if self.debug_dir is not None:
+            # Detect mode from nn.Module.training flag; separate flags for
+            # train/eval so each gets its own pair of HTMLs.
+            mode = "train" if self.training else "eval"
+            already_saved = (
+                self._saved_first_batch_train if self.training
+                else self._saved_first_batch_eval
+            )
+            if not already_saved:
+                if self.training:
+                    self._saved_first_batch_train = True
+                else:
+                    self._saved_first_batch_eval = True
+                try:
+                    # Detach everything to CPU for visualization
+                    all_points_cpu = points.detach().cpu()      # (B, N_total, 3)
+                    view_ids_cpu = view_ids.detach().cpu()       # (B, N_total)
+                    mask_cpu = mask.detach().cpu()                # (B, N_total)
+                    sampled_cpu = sampled_points.detach().cpu()   # (B, num_points, 3)
+                    cam_names = camera_names or [f"cam_{v}" for v in range(V)]
+                    bounds_cpu = self._bounds.detach().cpu()
+
+                    # Save for first (idx=0) and last (idx=B-1) batch elements
+                    for label, b_idx in [("first", 0), ("last", B - 1)]:
+                        save_point_cloud_html(
+                            all_points=all_points_cpu[b_idx],
+                            view_ids=view_ids_cpu[b_idx],
+                            valid_mask=mask_cpu[b_idx],
+                            sampled_points=sampled_cpu[b_idx],
+                            camera_names=cam_names,
+                            workspace_bounds=bounds_cpu,
+                            debug_dir=self.debug_dir,
+                            mode=mode,
+                            tag=label,
+                        )
+                except Exception as exc:
+                    logger.warning("DGCNN point cloud HTML save failed: %s", exc)
+
         return tokens
 
 
 # ------------------------------------------------------------------
-# Visualization
+# Visualization — interactive 3D HTML via Plotly
 # ------------------------------------------------------------------
 
 
-def render_point_cloud_projections(
-    points: torch.Tensor,
-    workspace_bounds: tuple[tuple[float, float], ...] = (
-        (-0.5, 4.5),
-        (-1.5, 1.5),
-        (1.0, 3.5),
-    ),
-    scale: int = 4,
-) -> np.ndarray:
-    """Render three orthographic projections of a point cloud.
+_PLOTLY_COLORS = [
+    "rgb(214,39,40)", "rgb(31,119,180)", "rgb(44,160,44)",
+    "rgb(255,127,14)", "rgb(148,103,189)", "rgb(23,190,207)",
+]
 
-    Produces a composite image with three views side-by-side:
-      - **XY** (top-down)
-      - **XZ** (front)
-      - **YZ** (side)
 
-    Points are coloured by Z-depth (near = red, far = blue).
+def save_point_cloud_html(
+    all_points: torch.Tensor,
+    view_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    sampled_points: torch.Tensor,
+    camera_names: list[str],
+    workspace_bounds: torch.Tensor,
+    debug_dir: str,
+    mode: str = "train",
+    tag: str = "first",
+    max_display_points: int = 8000,
+) -> None:
+    """Save an interactive 3D point cloud visualization as an HTML file.
+
+    Produces a Plotly figure with:
+      - One trace per camera showing the full back-projected point cloud
+        (filtered to workspace bounds + valid depth).
+      - One trace for the final randomly sampled points actually consumed
+        by the DGCNN encoder.
+      - Workspace bounding box wireframe.
+      - World-frame axis indicators.
 
     Args:
-        points: ``(N, 3)`` point cloud on CPU.
-        workspace_bounds: Per-axis ``(min, max)`` bounds for normalisation.
-        scale: Integer upscale factor for visibility (default 4).
-
-    Returns:
-        ``(H, W, 3)`` uint8 numpy array suitable for saving as PNG.
+        all_points: ``(N_total, 3)`` all back-projected points (single batch element).
+        view_ids: ``(N_total,)`` camera index per point (0, 1, …, V-1).
+        valid_mask: ``(N_total,)`` bool mask after workspace + depth filtering.
+        sampled_points: ``(num_points, 3)`` the subset actually fed to DGCNN.
+        camera_names: list of camera names matching view indices.
+        workspace_bounds: ``(3, 2)`` tensor with ``[lo, hi]`` per axis.
+        debug_dir: directory to save the HTML file.
+        mode: ``"train"`` or ``"eval"``.
+        tag: additional label, e.g. ``"first"`` or ``"last"``.
+        max_display_points: subsample each trace to at most this many points.
     """
-    pts = points.numpy() if isinstance(points, torch.Tensor) else np.asarray(points)
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        logger.warning("plotly not installed — skipping point cloud HTML save")
+        return
 
-    if pts.shape[0] == 0:
-        # Degenerate: return a small grey image
-        res = 64
-        return np.full((res, res * 3 + 4, 3), 40, dtype=np.uint8)
+    pts_np = all_points.numpy() if isinstance(all_points, torch.Tensor) else np.asarray(all_points)
+    vids_np = view_ids.numpy() if isinstance(view_ids, torch.Tensor) else np.asarray(view_ids)
+    mask_np = valid_mask.numpy() if isinstance(valid_mask, torch.Tensor) else np.asarray(valid_mask)
+    sampled_np = sampled_points.numpy() if isinstance(sampled_points, torch.Tensor) else np.asarray(sampled_points)
+    bounds_np = workspace_bounds.numpy() if isinstance(workspace_bounds, torch.Tensor) else np.asarray(workspace_bounds)
 
-    bounds = np.array(workspace_bounds)  # (3, 2)
-    lo = bounds[:, 0]
-    hi = bounds[:, 1]
+    fig = go.Figure()
 
-    # Normalise to [0, 1] within workspace
-    span = hi - lo
-    span[span == 0] = 1.0  # avoid division by zero
-    normed = (pts - lo) / span  # (N, 3)
-    normed = np.clip(normed, 0, 1)
+    # --- Per-camera point clouds (valid only, ALL points) ---
+    V = len(camera_names)
+    for v_idx in range(V):
+        cam_mask = (vids_np == v_idx) & mask_np
+        cam_pts = pts_np[cam_mask]
+        if len(cam_pts) == 0:
+            continue
+        color = _PLOTLY_COLORS[v_idx % len(_PLOTLY_COLORS)]
+        fig.add_trace(go.Scatter3d(
+            x=cam_pts[:, 0], y=cam_pts[:, 1], z=cam_pts[:, 2],
+            mode="markers",
+            marker=dict(size=1.5, color=color, opacity=0.5),
+            name=f"{camera_names[v_idx]} ({len(cam_pts)} pts)",
+        ))
 
-    # Colour by Z-depth: near (low Z) = red, far (high Z) = blue
-    z_norm = normed[:, 2]  # (N,)
-    # Simple red-to-blue colormap: R = (1-z), G = 0, B = z
-    colors = np.stack([
-        (1.0 - z_norm) * 255,
-        np.zeros_like(z_norm),
-        z_norm * 255,
-    ], axis=-1).astype(np.uint8)  # (N, 3)
+    # --- Sampled points (what DGCNN actually processes, ALL points) ---
+    fig.add_trace(go.Scatter3d(
+        x=sampled_np[:, 0], y=sampled_np[:, 1], z=sampled_np[:, 2],
+        mode="markers",
+        marker=dict(size=2.5, color="rgb(0,0,0)", opacity=0.9),
+        name=f"sampled ({len(sampled_np)} pts)",
+    ))
 
-    res = 64  # resolution of each projection view
+    # --- Workspace bounding box (transparent solid + wireframe) ---
+    lo = bounds_np[:, 0]  # (3,)
+    hi = bounds_np[:, 1]  # (3,)
+    # 8 corners of the box
+    corners = np.array([
+        [lo[0], lo[1], lo[2]],  # 0
+        [hi[0], lo[1], lo[2]],  # 1
+        [hi[0], hi[1], lo[2]],  # 2
+        [lo[0], hi[1], lo[2]],  # 3
+        [lo[0], lo[1], hi[2]],  # 4
+        [hi[0], lo[1], hi[2]],  # 5
+        [hi[0], hi[1], hi[2]],  # 6
+        [lo[0], hi[1], hi[2]],  # 7
+    ])
+    # 12 triangles (2 per face) defining the 6 faces of the box
+    tri_i = [0, 0, 4, 4, 0, 0, 2, 2, 0, 0, 3, 3]
+    tri_j = [1, 2, 5, 6, 1, 4, 3, 7, 3, 4, 2, 6]
+    tri_k = [2, 3, 6, 7, 5, 7, 7, 6, 4, 7, 6, 7]
+    fig.add_trace(go.Mesh3d(
+        x=corners[:, 0], y=corners[:, 1], z=corners[:, 2],
+        i=tri_i, j=tri_j, k=tri_k,
+        color="lightblue",
+        opacity=0.08,
+        name="workspace bounds",
+        showlegend=True,
+    ))
+    # Wireframe edges on top for clarity
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),  # bottom face
+        (4, 5), (5, 6), (6, 7), (7, 4),  # top face
+        (0, 4), (1, 5), (2, 6), (3, 7),  # vertical edges
+    ]
+    for i, j in edges:
+        fig.add_trace(go.Scatter3d(
+            x=[corners[i, 0], corners[j, 0]],
+            y=[corners[i, 1], corners[j, 1]],
+            z=[corners[i, 2], corners[j, 2]],
+            mode="lines",
+            line=dict(color="rgba(70,130,180,0.6)", width=3),
+            showlegend=False,
+        ))
 
-    def _project(ax0: int, ax1: int) -> np.ndarray:
-        """Scatter points onto a 2D grid along two axes."""
-        img = np.full((res, res, 3), 40, dtype=np.uint8)  # dark grey background
-        # Map normalised coordinates to pixel indices
-        u = (normed[:, ax0] * (res - 1)).astype(int)
-        v = ((1.0 - normed[:, ax1]) * (res - 1)).astype(int)  # flip Y for image coords
-        u = np.clip(u, 0, res - 1)
-        v = np.clip(v, 0, res - 1)
-        # Paint (later points overwrite earlier ones — good enough for viz)
-        img[v, u] = colors
-        return img
+    # --- World origin axes ---
+    for ax_i, (color, name) in enumerate(zip(
+        ["red", "green", "blue"], ["Xw", "Yw", "Zw"],
+    )):
+        end = np.zeros(3)
+        end[ax_i] = 0.15
+        fig.add_trace(go.Scatter3d(
+            x=[0, end[0]], y=[0, end[1]], z=[0, end[2]],
+            mode="lines+text",
+            line=dict(color=color, width=5),
+            text=["", name],
+            textposition="top center",
+            showlegend=False,
+        ))
 
-    proj_xy = _project(0, 1)  # top-down: X horizontal, Y vertical
-    proj_xz = _project(0, 2)  # front:    X horizontal, Z vertical
-    proj_yz = _project(1, 2)  # side:     Y horizontal, Z vertical
+    fig.update_layout(
+        title=f"DGCNN Point Cloud — {mode} / {tag}",
+        scene=dict(
+            xaxis_title="X (world)",
+            yaxis_title="Y (world)",
+            zaxis_title="Z (world)",
+            aspectmode="data",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
 
-    # 2-pixel white separator between views
-    sep = np.full((res, 2, 3), 200, dtype=np.uint8)
-    composite = np.concatenate([proj_xy, sep, proj_xz, sep, proj_yz], axis=1)
-
-    # Upscale for visibility
-    if scale > 1:
-        composite = np.repeat(np.repeat(composite, scale, axis=0), scale, axis=1)
-
-    return composite
+    import os
+    os.makedirs(debug_dir, exist_ok=True)
+    save_path = os.path.join(debug_dir, f"dgcnn_point_cloud_{mode}_{tag}.html")
+    fig.write_html(save_path)
+    logger.info("Saved DGCNN point cloud HTML (%s/%s) to: %s", mode, tag, save_path)

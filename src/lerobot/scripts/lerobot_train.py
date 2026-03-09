@@ -323,6 +323,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
+    # Propagate the training output_dir to the policy config so debug
+    # artifacts (observation mosaic, point cloud HTML) are saved to
+    # {output_dir}/debug/.  Must happen BEFORE make_policy() so the value
+    # flows through _create_groot_model → DGCNNEncoder.__init__.
+    if hasattr(cfg.policy, "debug_dir"):
+        cfg.policy.debug_dir = str(Path(cfg.output_dir) / "debug")
+
     if is_main_process:
         logging.info("Creating policy")
     policy = make_policy(
@@ -345,11 +352,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}
-
-    # Propagate the training output_dir to the policy config so the diagnostic
-    # observation mosaic is saved to {output_dir}/debug/.
-    if hasattr(cfg.policy, "output_dir"):
-        cfg.policy.debug_dir = str(Path(cfg.output_dir) / "debug")
 
     if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
@@ -540,21 +542,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
-            # Save DGCNN point cloud visualization if encoder is active
-            _unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
-            _groot_model = getattr(_unwrapped, "_groot_model", None)
-            _dgcnn_enc = getattr(getattr(_groot_model, "backbone", None), "point_cloud_encoder", None) if _groot_model else None
-            if _dgcnn_enc is not None and hasattr(_dgcnn_enc, "_last_point_cloud"):
-                try:
-                    from pathlib import Path
-                    from lerobot.policies.groot.dgcnn_encoder import render_point_cloud_projections
-                    from PIL import Image
-                    viz_dir = Path(cfg.output_dir) / "dgcnn_viz"
-                    viz_dir.mkdir(parents=True, exist_ok=True)
-                    img_arr = render_point_cloud_projections(_dgcnn_enc._last_point_cloud)
-                    Image.fromarray(img_arr).save(viz_dir / f"step_{step:06d}.png")
-                except Exception as viz_exc:
-                    logging.warning(f"DGCNN visualization failed at step {step}: {viz_exc}")
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:

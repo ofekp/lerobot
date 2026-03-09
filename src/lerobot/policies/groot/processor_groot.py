@@ -141,6 +141,7 @@ def make_groot_pre_post_processors(
             embodiment_tag=config.embodiment_tag,
             normalize_min_max=True,
             stats=padded_stats,
+            use_depth=getattr(config, 'use_depth', False),
         ),
         # 4. Eagle encode RGB images (creates eagle_content)
         GrootEagleEncodeStep(
@@ -151,14 +152,9 @@ def make_groot_pre_post_processors(
             tokenizer_assets_repo=config.tokenizer_assets_repo,
             debug_dir=getattr(config, 'debug_dir', None),
         ),
+        # 6. Move to device
+        DeviceProcessorStep(device=config.device),
     ]
-
-    # 6. Add DGCNN prep step if depth is enabled
-    if getattr(config, 'use_depth', False):
-        input_steps.append(GrootDgcnnPrepStep())
-
-    # 7. Move to device (always last)
-    input_steps.append(DeviceProcessorStep(device=config.device))
 
     # Postprocessing: slice to env action dim and unnormalize to env scale, then move to CPU
     output_steps: list[ProcessorStep] = [
@@ -195,6 +191,37 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
     return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
 
 
+def _prepare_depth_tensor(depth_t: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    """Prepare depth tensor for late fusion with RGB.
+    
+    Keeps depth values unnormalized (preserving metric depth information).
+    Only reshapes and resizes to match RGB spatial dimensions.
+    
+    Args:
+        depth_t: Depth tensor of shape (B, 1, H, W) or (B, H, W), any dtype
+        target_h: Target height to match RGB
+        target_w: Target width to match RGB
+        
+    Returns:
+        torch.Tensor of shape (B, 1, H, W) as float32, unnormalized
+    """
+    # Handle different input shapes
+    if depth_t.dim() == 3:  # (B, H, W)
+        depth_t = depth_t.unsqueeze(1)  # (B, 1, H, W)
+    
+    # Convert to float32 if needed (preserve actual values)
+    depth_t = depth_t.to(torch.float32)
+    
+    # Resize if needed to match RGB dimensions
+    b, c, h, w = depth_t.shape
+    if h != target_h or w != target_w:
+        depth_t = torch.nn.functional.interpolate(
+            depth_t, size=(target_h, target_w), mode='nearest'
+        )
+    
+    return depth_t.cpu()
+
+
 def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
     # Validate that the cache directory is ready. If not, instruct the user.
     cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
@@ -226,29 +253,26 @@ def save_observation_mosaic(
     depth_mean: float = 0.0,
     depth_std: float = 1.0,
 ) -> None:
-    """Save a diagnostic mosaic of the *final* processed observations fed to the model.
+    """Save a diagnostic mosaic of processed observations for debugging.
 
-    Called after Eagle collate + depth fusion — the tensors visualised here are
-    **exactly** what enters the GR00T backbone (the next step is only
-    ``DeviceProcessorStep`` which moves tensors to GPU without changing values).
+    Called after Eagle collate.  RGB panels show the Eagle-normalised
+    ``eagle_pixel_values`` (at 224×224) — **exactly** what the VLM backbone
+    receives.  Depth panels (if present) show ``depth_raw`` at its original
+    resolution in metres — this is what DGCNN consumes for back-projection,
+    *not* the Eagle-processed resolution.
 
     Each panel is one camera view.  RGB channels are de-normalised from Eagle
-    format (mean=0.5, std=0.5).  If ``depth_pixel_values`` is provided, each
-    depth view is shown alongside its RGB counterpart.
-
-    Images are flipped vertically before saving.
-
-    For **train** mode the mosaic is saved to ``output_dir/debug/``.
-    For **eval** mode it is saved to ``output_dir/../debug/`` so that both
-    mosaics sit in the same parent debug folder.
+    format (mean=0.5, std=0.5).  Depth is min-max scaled to [0, 255] for
+    visualisation.  Images are flipped vertically before saving.
 
     Args:
-        rgb_pixel_values: ``(N, 3, H, W)`` — Eagle-normalised RGB. N = B*V.
+        rgb_pixel_values: ``(N, 3, H_eagle, W_eagle)`` — Eagle-normalised RGB.
         num_views: Number of camera views per sample (V).
         img_keys: Observation key names for the RGB cameras.
-        output_dir: Top-level output directory (``--output_dir`` from CLI).
+        debug_dir: Directory for saving the mosaic image.
         mode: ``"train"`` or ``"eval"`` — included in the filename.
-        depth_pixel_values: Optional ``(N, 1, H, W)`` normalised depth.
+        depth_pixel_values: Optional ``(N, 1, H_depth, W_depth)`` raw depth in
+            metres (may differ from Eagle spatial dims).
         depth_keys: Observation key names for the depth cameras (may contain None).
         depth_scale: Scale used during depth normalisation (for de-normalisation).
         depth_mean: Mean used during depth normalisation.
@@ -390,6 +414,7 @@ class GrootPackInputsStep(ProcessorStep):
             "unitree_g1": 3,
         }
     )
+    use_depth: bool = False
     # Min-max normalization (SO100-like) applied BEFORE padding
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
@@ -464,13 +489,46 @@ class GrootPackInputsStep(ProcessorStep):
                 
                 # Prepare depth tensors (unnormalized, just resized to match RGB)
                 # TODO(ofekp): take care of the device when torch.zeros is called e.g. device=next(iter(obs.values())).device
-                # import pdb; pdb.set_trace()
                 depth_tensors = [_prepare_depth_tensor(obs[k], h, w) if k is not None else torch.zeros((b, 1, h, w)).cpu() for k in depth_keys]  # List of (B, 1, H, W)
                 
                 # Stack depth tensors: (B, V, 1, H, W) where V = num cameras
                 depth_stacked = torch.stack(depth_tensors, dim=1)  # (B, V, 1, H, W)
-                depth_stacked = depth_stacked.unsqueeze(1)  # (B, 1, V, 1, H, W) to match video T dim
-                obs["depth_raw"] = depth_stacked  # Keep for late fusion
+
+                # ── DGCNN inputs: collect intrinsics/extrinsics per camera ──
+                # We do this here (not in a later step) because the raw
+                # observation keys are dropped at the end of this block.
+                dgcnn_intrinsics = []
+                dgcnn_extrinsics = []
+                dgcnn_camera_names = []
+
+                for img_key in img_keys:
+                    # "observation.images.front" → cam_name = "front"
+                    parts = img_key.split(".")
+                    # TODO(ofekp): not supporting single image with key "observation.image" for now
+                    assert parts[-2] == "images"
+                    cam_name = parts[-1]
+                    dgcnn_camera_names.append(cam_name)
+
+                    ik = f"observation.camera.{cam_name}.intrinsics"
+                    ek = f"observation.camera.{cam_name}.extrinsics"
+                    intr = obs[ik]
+                    extr = obs[ek]
+                    assert intr is not None and extr is not None, f"[GROOT] Error: Missing intrinsics or extrinsics for camera '{cam_name}' (keys '{ik}' and '{ek}')"
+                    assert isinstance(intr, torch.Tensor) and isinstance(extr, torch.Tensor), f"[GROOT] Error: Intrinsics and extrinsics must be torch.Tensors for camera '{cam_name}'"
+                    assert intr.ndim == 3 or extr.ndim == 3, f"[GROOT] Error: Intrinsics and intrinsics must be (B, 3, 3) for camera '{cam_name}', got shape {intr.shape} and {extr.shape}"
+                    assert intr.shape[-1] == intr.shape[-2] == 3 and extr.shape[-1] == extr.shape[-2] == 4, f"[GROOT] Error: Intrinsics must be (B, 3, 3) and extrinsics must be (B, 4, 4) for camera '{cam_name}', got shape {intr.shape} and {extr.shape}"
+                    dgcnn_intrinsics.append(intr.to(torch.float32))
+                    dgcnn_extrinsics.append(extr.to(torch.float32))
+
+                # Store DGCNN camera params in complementary_data
+                # (depth is read from obs["depth_raw"] by the DGCNN encoder — no duplication)
+                assert dgcnn_intrinsics and len(dgcnn_intrinsics) == len(depth_tensors), "[GROOT] Error: No valid depth cameras found for DGCNN input."
+                comp["dgcnn_intrinsics"] = torch.stack(dgcnn_intrinsics, dim=1).unsqueeze(1)  # (B, T=1, V, 3, 3)
+                comp["dgcnn_extrinsics"] = torch.stack(dgcnn_extrinsics, dim=1).unsqueeze(1)  # (B, T=1, V, 4, 4)
+                comp["dgcnn_camera_names"] = dgcnn_camera_names
+
+                depth_stacked = depth_stacked.unsqueeze(1)  # (B, T=1, V, 1, H, W) to match video T dim
+                obs["depth_raw"] = depth_stacked  # Used by both Eagle late-fusion AND DGCNN encoder
 
             # Pass key names downstream for the diagnostic observation mosaic
             # (saved in GrootEagleCollateStep after eagle_pixel_values is finalised)
@@ -488,6 +546,13 @@ class GrootPackInputsStep(ProcessorStep):
             # Drop raw images to avoid confusion downstream
             for k in img_keys:
                 obs.pop(k, None)
+            # Drop original depth keys + camera param keys (already captured above)
+            if self.use_depth:
+                for k in list(obs.keys()):
+                    if "depth" in k.lower() and k != "depth_raw":
+                        obs.pop(k, None)
+                    elif any(suffix in k for suffix in (".intrinsics", ".extrinsics")):
+                        obs.pop(k, None)
 
         # 2) Language (string)
         lang = comp.get(self.language_key)
@@ -793,46 +858,23 @@ class GrootEagleCollateStep(ProcessorStep):
             comp[k] = v
         comp.pop("eagle_content", None)
 
-        # Late fusion: concatenate depth with RGB pixel_values if depth_raw exists
-        depth_raw = obs.get("depth_raw")
-        # depth_raw: (B, 1, V, 1, H, W) - raw depth values
-        # eagle_pixel_values: (N, 3, H', W') where N = B * T * V, normalized RGB
+        # ── Depth processing note ──
+        # Depth does NOT go through the Eagle processor pipeline (encode → collate).
+        # RGB needs Eagle's tokenizer, chat template, image normalization (mean=0.5,
+        # std=0.5), and resize to 224×224 — all specific to the Eagle VLM.
+        # Depth needs metric values in metres at original resolution for DGCNN's
+        # back-projection (K⁻¹ · [u,v,1] · d → 3D points).  Eagle normalization
+        # would destroy the geometry.  This is analogous to how text goes through
+        # a tokenizer while images go through an image processor — different
+        # modalities, different encoders, different preprocessing.
+        #
+        # depth_raw stays in obs untouched and is consumed by:
+        #   - DGCNNEncoder (in groot_n1.py) for 3D point cloud tokens
+        #   - The diagnostic mosaic below (for visualization only)
+
         assert "eagle_pixel_values" in comp, "[GROOT] eagle_pixel_values not found in complementary data after collate."
-        pixel_values = comp["eagle_pixel_values"]  # (N, 3, H', W')
-        if depth_raw is not None and "eagle_pixel_values" in comp:
-            n, c, h_pv, w_pv = pixel_values.shape  # [3, 3, 224, 224]
-            
-            # Reshape depth to match pixel_values layout
-            # depth_raw is (B, T=1, V, 1, H, W), we need (N, 1, H', W')
-            b, t, v, _, h_d, w_d = depth_raw.shape  # [3, 1, 1, 1, 256, 256]
-            depth_flat = depth_raw.view(b * t * v, 1, h_d, w_d)  # (N, 1, H, W)
 
-            assert depth_flat.shape[0] == pixel_values.shape[0]
-            
-            # Resize depth to match pixel_values spatial dims if needed
-            # even though we already matched the depth to the rgb, the rgb is resized inside eagle processor
-            # this resize happens inside the `collate(features, self.proc)` call above
-            if h_d != h_pv or w_d != w_pv:
-                depth_flat = torch.nn.functional.interpolate(
-                    depth_flat, size=(h_pv, w_pv), mode='nearest'
-                )
-            
-            # Normalize depth for fusion (converts raw values to normalized scale)
-            depth_normalized = _normalize_depth_for_fusion(
-                depth_flat,
-                depth_scale=self.depth_scale,
-                depth_mean=self.depth_mean,
-                depth_std=self.depth_std,
-            )
-
-            # our scaling is not doing anything on purpose (mean 0, std 1, scale 1) given in the cli command
-            # depth_flat == depth_normalized and are in meters
-
-            # Concatenate depth as 4th channel: (N, 4, H', W')
-            pixel_values_rgbd = torch.cat([pixel_values, depth_normalized], dim=1)
-            comp["eagle_pixel_values"] = pixel_values_rgbd
-            
-         # --- Diagnostic observation mosaic (once, on first batch) ---
+        # --- Diagnostic observation mosaic (once, on first batch) ---
         # This is the LAST preprocessing step before DeviceProcessorStep (GPU move).
         # The eagle_pixel_values tensor shown here is EXACTLY what the GR00T backbone receives.
         if not self._saved_mosaic:
@@ -845,9 +887,14 @@ class GrootEagleCollateStep(ProcessorStep):
             img_keys = comp.pop("_mosaic_img_keys", [])
             depth_keys = comp.pop("_mosaic_depth_keys", None)
 
-            epv = comp["eagle_pixel_values"]  # (N, C, H, W)
-            rgb_pv = epv[:, :3]  # (N, 3, H, W)
-            depth_pv = epv[:, 3:4] if epv.shape[1] == 4 else None  # (N, 1, H, W) or None
+            rgb_pv = comp["eagle_pixel_values"]  # (N, 3, H, W)
+            # Derive depth for mosaic directly from depth_raw (no intermediate tensor)
+            depth_pv = None
+            depth_raw_obs = obs.get("depth_raw")
+            if depth_raw_obs is not None:
+                # Flatten (B, T=1, V, 1, H, W) → (N, 1, H, W) for visualization
+                b_d, t_d, v_d, _, h_d, w_d = depth_raw_obs.shape
+                depth_pv = depth_raw_obs.view(b_d * t_d * v_d, 1, h_d, w_d)
 
             save_observation_mosaic(
                 rgb_pixel_values=rgb_pv,
@@ -857,17 +904,17 @@ class GrootEagleCollateStep(ProcessorStep):
                 mode=mode,
                 depth_pixel_values=depth_pv,
                 depth_keys=depth_keys,
-                depth_scale=self.depth_scale,
-                depth_mean=self.depth_mean,
-                depth_std=self.depth_std,
+                depth_scale=1,
+                depth_mean=0,
+                depth_std=1,
             )
             save_eagle_processor_config(
                 proc=self.proc,
                 debug_dir=self.debug_dir,
                 mode=mode,
-                depth_scale=self.depth_scale,
-                depth_mean=self.depth_mean,
-                depth_std=self.depth_std,
+                depth_scale=1,
+                depth_mean=0,
+                depth_std=1,
             )
         else:
             # Clean up metadata keys on subsequent batches
@@ -889,101 +936,29 @@ class GrootEagleCollateStep(ProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register(name="groot_dgcnn_prep_v1")
 class GrootDgcnnPrepStep(ProcessorStep):
-    """Prepare DGCNN encoder inputs from depth and camera params.
+    """DEPRECATED — kept for backward-compatible checkpoint loading only.
 
-    Self-contained: extracts depth directly from ``obs["observation.images.*.depth"]``
-    keys, along with intrinsics and extrinsics, and stores them as ``dgcnn_*`` keys
-    in complementary data for the EagleBackbone to pass to DGCNNEncoder.
+    This logic has been moved into ``GrootPackInputsStep`` (step 3 in the
+    pipeline) because the raw observation keys (``observation.images.*.depth``,
+    ``observation.camera.*.intrinsics``, etc.) are dropped at the end of that
+    step.  Running this step later would find no matching keys.
+
+    If ``dgcnn_depth`` already exists in complementary data (set by
+    ``GrootPackInputsStep``), this step is a no-op.  Old checkpoint JSONs
+    that reference ``groot_dgcnn_prep_v1`` will still deserialize cleanly.
     """
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
-        obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
-
-        # Extract depth tensors from observation keys
-        depth_keys = sorted([k for k in obs if k.startswith("observation.images.") and "depth" in k.lower()])
-        if not depth_keys:
-            transition[TransitionKey.OBSERVATION] = obs
-            transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+        if "dgcnn_depth" in comp:
+            # Already populated by GrootPackInputsStep — nothing to do.
             return transition
 
-        # For each depth key, find corresponding intrinsics/extrinsics
-        # Depth: observation.images.{cam}.depth
-        # Camera params: observation.camera.{cam}.intrinsics or observation.images.{cam}.intrinsics
-        depth_tensors = []
-        intrinsics_tensors = []
-        extrinsics_tensors = []
-        camera_names = []
-
-        for dk in depth_keys:
-            d = obs[dk]
-            if not isinstance(d, torch.Tensor):
-                continue
-
-            # Extract camera name: "observation.images.front.depth" -> "front"
-            parts = dk.split(".")
-            img_idx = parts.index("images")
-            cam_name = ".".join(parts[img_idx + 1 : -1])
-
-            # Find intrinsics/extrinsics under observation.camera.{cam} or observation.images.{cam}
-            intr = None
-            extr = None
-            for prefix in [f"observation.camera.{cam_name}", f"observation.images.{cam_name}"]:
-                ik = f"{prefix}.intrinsics"
-                ek = f"{prefix}.extrinsics"
-                if ik in obs and ek in obs:
-                    intr = obs[ik]
-                    extr = obs[ek]
-                    break
-
-            if intr is None or extr is None:
-                continue
-
-            # Normalize depth shape to (B, 1, H, W)
-            if d.dim() == 2:  # (H, W)
-                d = d.unsqueeze(0).unsqueeze(0)
-            elif d.dim() == 3:  # (B, H, W) or (1, H, W)
-                d = d.unsqueeze(1)
-            depth_tensors.append(d.to(torch.float32))
-            camera_names.append(cam_name)
-
-            # Normalize intrinsics to (B, 3, 3)
-            if isinstance(intr, torch.Tensor):
-                if intr.dim() == 2:
-                    intr = intr.unsqueeze(0)
-                intrinsics_tensors.append(intr.to(torch.float32))
-
-            # Normalize extrinsics to (B, 4, 4)
-            if isinstance(extr, torch.Tensor):
-                if extr.dim() == 2:
-                    extr = extr.unsqueeze(0)
-                extrinsics_tensors.append(extr.to(torch.float32))
-
-        if not depth_tensors or len(depth_tensors) != len(intrinsics_tensors):
-            transition[TransitionKey.OBSERVATION] = obs
-            transition[TransitionKey.COMPLEMENTARY_DATA] = comp
-            return transition
-
-        # Stack across views: (B, V, 1, H, W), (B, V, 3, 3), (B, V, 4, 4)
-        dgcnn_depth = torch.stack(depth_tensors, dim=1)
-        dgcnn_intrinsics = torch.stack(intrinsics_tensors, dim=1)
-        dgcnn_extrinsics = torch.stack(extrinsics_tensors, dim=1)
-
-        # Convert mm to meters if needed
-        if dgcnn_depth.max() > 100:
-            dgcnn_depth = dgcnn_depth / 1000.0
-
-        assert dgcnn_depth.abs().sum() > 0, (
-            "dgcnn_depth is all zeros — depth data not loaded correctly from dataset"
+        # Legacy path (should not be reached with current pipeline wiring)
+        logging.warning(
+            "[GrootDgcnnPrepStep] dgcnn_depth not found in complementary data. "
+            "Intrinsics/extrinsics/depth should be collected by GrootPackInputsStep."
         )
-
-        comp["dgcnn_depth"] = dgcnn_depth
-        comp["dgcnn_intrinsics"] = dgcnn_intrinsics
-        comp["dgcnn_extrinsics"] = dgcnn_extrinsics
-        comp["dgcnn_camera_names"] = camera_names
-
-        transition[TransitionKey.OBSERVATION] = obs
-        transition[TransitionKey.COMPLEMENTARY_DATA] = comp
         return transition
 
     def transform_features(self, features):

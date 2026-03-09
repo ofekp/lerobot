@@ -67,6 +67,7 @@ class EagleBackbone(nn.Module):
         tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO,
         project_to_dim: int = 1536,
         use_depth: bool = False,
+        debug_dir: str | None = None,
         dgcnn_workspace_bounds: tuple = ((-0.3, 0.3), (-0.3, 0.3), (0.6, 1.0)),
         dgcnn_num_points: int = 2048,
         dgcnn_k: int = 20,
@@ -128,6 +129,7 @@ class EagleBackbone(nn.Module):
                 num_tokens=dgcnn_num_tokens,
                 workspace_bounds=dgcnn_workspace_bounds,
                 camera_weights=dgcnn_camera_weights,
+                debug_dir=debug_dir,
             )
             print(f"[GROOT] DGCNNEncoder initialized: points={dgcnn_num_points}, k={dgcnn_k}, "
                   f"tokens={self.point_cloud_encoder.num_tokens}, "
@@ -205,46 +207,50 @@ class EagleBackbone(nn.Module):
 
         # DGCNN point cloud encoder: concat 3D spatial tokens with Eagle tokens
         if self.use_depth and self.point_cloud_encoder is not None:
-            pc_depth = vl_input.get("dgcnn_depth")
+            # depth_raw lives in obs (shared with Eagle late-fusion); camera
+            # params are in complementary_data under dgcnn_* keys.
+            # All stored as (B, T=1, V, ...); squeeze T before point cloud encoder.
+            pc_depth = vl_input.get("depth_raw")
             pc_intrinsics = vl_input.get("dgcnn_intrinsics")
             pc_extrinsics = vl_input.get("dgcnn_extrinsics")
             pc_camera_names = vl_input.get("dgcnn_camera_names")
+            # remove the time dimension if it exists and is 1, since DGCNN expects per-frame inputs
+            if pc_depth is not None and pc_depth.dim() == 6:      # (B, T, V, 1, H, W)
+                pc_depth = pc_depth[:, -1]                         # (B, V, 1, H, W)
+            if pc_intrinsics is not None and pc_intrinsics.dim() == 5:  # (B, T, V, 3, 3)
+                pc_intrinsics = pc_intrinsics[:, -1]               # (B, V, 3, 3)
+            if pc_extrinsics is not None and pc_extrinsics.dim() == 5:  # (B, T, V, 4, 4)
+                pc_extrinsics = pc_extrinsics[:, -1]               # (B, V, 4, 4)
 
-            if all(v is not None for v in [pc_depth, pc_intrinsics, pc_extrinsics]):
-                pc_tokens = self.point_cloud_encoder(
-                    pc_depth, pc_intrinsics, pc_extrinsics,
-                    camera_names=pc_camera_names,
-                )
-                pc_tokens = pc_tokens.to(dtype=eagle_embeds.dtype, device=eagle_embeds.device)
+            assert all(v is not None for v in [pc_depth, pc_intrinsics, pc_extrinsics])
+            pc_tokens = self.point_cloud_encoder(
+                pc_depth, pc_intrinsics, pc_extrinsics,
+                camera_names=pc_camera_names,
+            )
+            pc_tokens = pc_tokens.to(dtype=eagle_embeds.dtype, device=eagle_embeds.device)
 
-                # --- DGCNN verification assertions ---
-                assert pc_tokens.abs().sum() > 0, (
-                    "DGCNN tokens are all zeros — depth encoder is not producing useful features"
-                )
-                assert pc_tokens.shape[1:] == (self.point_cloud_encoder.num_tokens, eagle_embeds.shape[-1]), (
-                    f"DGCNN token shape mismatch: got {pc_tokens.shape}, "
-                    f"expected (B, {self.point_cloud_encoder.num_tokens}, {eagle_embeds.shape[-1]})"
-                )
+            # --- DGCNN verification assertions ---
+            assert pc_tokens.abs().sum() > 0, (
+                "DGCNN tokens are all zeros — depth encoder is not producing useful features"
+            )
+            assert pc_tokens.shape[1:] == (self.point_cloud_encoder.num_tokens, eagle_embeds.shape[-1]), (
+                f"DGCNN token shape mismatch: got {pc_tokens.shape}, "
+                f"expected (B, {self.point_cloud_encoder.num_tokens}, {eagle_embeds.shape[-1]})"
+            )
 
-                n_eagle = eagle_embeds.shape[1]
-                eagle_embeds = torch.cat([eagle_embeds, pc_tokens], dim=1)
+            n_eagle = eagle_embeds.shape[1]
+            eagle_embeds = torch.cat([eagle_embeds, pc_tokens], dim=1)
 
-                assert eagle_embeds.shape[1] == n_eagle + pc_tokens.shape[1], (
-                    f"DGCNN tokens not aggregated: {eagle_embeds.shape[1]} != {n_eagle} + {pc_tokens.shape[1]}"
-                )
+            assert eagle_embeds.shape[1] == n_eagle + pc_tokens.shape[1], (
+                f"DGCNN tokens not aggregated: {eagle_embeds.shape[1]} != {n_eagle} + {pc_tokens.shape[1]}"
+            )
 
-                pc_mask = torch.ones(
-                    pc_tokens.shape[0], pc_tokens.shape[1],
-                    dtype=eagle_mask.dtype, device=eagle_mask.device,
-                )
-                eagle_mask = torch.cat([eagle_mask, pc_mask], dim=1)
-            else:
-                import warnings
-                warnings.warn(
-                    "use_depth=True but dgcnn_depth/intrinsics/extrinsics missing from input — "
-                    "DGCNN is configured but NOT being used this forward pass",
-                    RuntimeWarning, stacklevel=2,
-                )
+            pc_mask = torch.ones(
+                pc_tokens.shape[0], pc_tokens.shape[1],
+                dtype=eagle_mask.dtype, device=eagle_mask.device,
+            )
+            eagle_mask = torch.cat([eagle_mask, pc_mask], dim=1)
+
 
         return BatchFeature(
             data={"backbone_features": eagle_embeds, "backbone_attention_mask": eagle_mask}
@@ -440,6 +446,7 @@ class GR00TN15(PreTrainedModel):
         dgcnn_k = kwargs.pop("dgcnn_k", 20)
         dgcnn_num_tokens = kwargs.pop("dgcnn_num_tokens", 64)
         dgcnn_camera_weights = kwargs.pop("dgcnn_camera_weights", None)
+        debug_dir = kwargs.pop("debug_dir", None)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
@@ -490,6 +497,7 @@ class GR00TN15(PreTrainedModel):
                 config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
                 config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
                 config_dict["backbone_cfg"]["dgcnn_camera_weights"] = dgcnn_camera_weights
+                config_dict["backbone_cfg"]["debug_dir"] = debug_dir
 
             config = cls.config_class(**config_dict)
             pretrained_model = cls(config, local_model_path=local_model_path)
@@ -511,6 +519,7 @@ class GR00TN15(PreTrainedModel):
                     config_dict["backbone_cfg"]["dgcnn_k"] = dgcnn_k
                     config_dict["backbone_cfg"]["dgcnn_num_tokens"] = dgcnn_num_tokens
                     config_dict["backbone_cfg"]["dgcnn_camera_weights"] = dgcnn_camera_weights
+                    config_dict["backbone_cfg"]["debug_dir"] = debug_dir
 
                 config = cls.config_class(**config_dict)
                 kwargs["config"] = config
