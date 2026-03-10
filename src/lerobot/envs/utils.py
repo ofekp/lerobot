@@ -99,7 +99,7 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
                 depth_tensor = torch.from_numpy(depth)
                 
                 assert depth_tensor.ndim == 3
-                depth_tensor = depth_tensor.unsqueeze(1)  # (1, H, W) -> (1, 1, H, W)
+                depth_tensor = depth_tensor.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
                 
                 # Convert uint16 mm to float32 meters
                 depth_tensor = depth_tensor.to(torch.float32) / 1000.0
@@ -116,7 +116,7 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
             # Single depth: just observation.depth
             depth_tensor = torch.from_numpy(observations["depths"])
             assert depth_tensor.ndim == 3
-            depth_tensor = depth_tensor.unsqueeze(1)  # (1, H, W) -> (1, 1, H, W)
+            depth_tensor = depth_tensor.unsqueeze(1)  # (B, H, W) -> (B, 1, H, W)
             depth_tensor = depth_tensor.to(torch.float32) / 1000.0
             return_observations[f"{OBS_IMAGE}.depth"] = depth_tensor
 
