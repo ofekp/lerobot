@@ -209,9 +209,10 @@ class GrootPolicy(PreTrainedPolicy):
         """Verify GR00T model architecture matches config expectations.
 
         Checks:
-          - Patch embedding input channels == 4 if use_depth else 3.
+          - Patch embedding input channels == 3 (CHNet processes depth via a
+            separate CNN encoder, so the ViT patch embedding stays RGB-only).
         """
-        expected_channels = 4 if self.config.use_depth else 3
+        expected_channels = 3  # CHNet keeps patch embedding at 3 channels
         patch_key = (
             "_groot_model.backbone.eagle_model.vision_model."
             "vision_model.embeddings.patch_embedding.weight"
