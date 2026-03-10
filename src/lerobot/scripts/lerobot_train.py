@@ -445,6 +445,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    # Initialize depth diagnostics automatically if policy supports it
+    unwrapped_policy = accelerator.unwrap_model(policy) if hasattr(accelerator, 'unwrap_model') else policy
+    if hasattr(unwrapped_policy, "init_diagnostics"):
+        camera_names = [k for k in dataset.meta.features if "image" in k and "depth" not in k]
+        unwrapped_policy.init_diagnostics(
+            output_dir=cfg.output_dir,
+            dataset_info={"camera_names": camera_names},
+        )
+
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False

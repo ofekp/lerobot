@@ -298,6 +298,11 @@ def eval_policy(
     policy.eval()
     print("Policy is now in eval mode (policy.eval() called).")
 
+    # Initialize depth diagnostics for standalone eval if not already initialized
+    if hasattr(policy, "init_diagnostics") and getattr(policy, "_diagnostics", None) is None:
+        eval_output_dir = videos_dir.parent if videos_dir else Path("./eval_diagnostics")
+        policy.init_diagnostics(output_dir=eval_output_dir)
+
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
     # divisible by env.num_envs we end up discarding some data in the last batch.
     n_batches = n_episodes // env.num_envs + int((n_episodes % env.num_envs) != 0)
