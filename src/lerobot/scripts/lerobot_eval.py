@@ -637,6 +637,12 @@ def eval_main(cfg: EvalPipelineConfig):
 
     logging.info("Making policy.")
 
+    # Propagate eval output_dir to policy config so debug artifacts
+    # (observation mosaic, point cloud HTML) are saved.  Must happen
+    # BEFORE make_policy() so the value flows through to DGCNNEncoder.
+    if hasattr(cfg.policy, "debug_dir"):
+        cfg.policy.debug_dir = str(Path(cfg.output_dir).parent / "debug")
+
     policy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
@@ -663,11 +669,6 @@ def eval_main(cfg: EvalPipelineConfig):
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
-
-    # Propagate eval output_dir to policy config so the diagnostic observation
-    # mosaic is saved to {output_dir}/../debug/ (parent of eval sub-dir).
-    if hasattr(cfg.policy, "debug_dir"):
-        cfg.policy.debug_dir = str(Path(cfg.output_dir).parent / "debug")
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,

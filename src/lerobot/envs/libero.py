@@ -219,6 +219,19 @@ class LiberoEnv(gym.Env):
                     dtype=np.uint16,
                 )
 
+        # Per-camera intrinsics / extrinsics spaces (keyed by mapped cam name)
+        cam_intrinsic_spaces = {}
+        cam_extrinsic_spaces = {}
+        if self.use_depth:
+            for cam in self.camera_name:
+                mapped = self.camera_name_mapping[cam]  # e.g. "front", "wrist"
+                cam_intrinsic_spaces[mapped] = spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(3, 3), dtype=np.float32,
+                )
+                cam_extrinsic_spaces[mapped] = spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(4, 4), dtype=np.float32,
+                )
+
         if self.obs_type == "state":
             raise NotImplementedError(
                 "The 'state' observation type is not supported in LiberoEnv. "
@@ -229,6 +242,8 @@ class LiberoEnv(gym.Env):
             obs_space = {"pixels": spaces.Dict(images)}
             if self.use_depth:
                 obs_space["depths"] = spaces.Dict(depths)
+                obs_space["camera_intrinsics"] = spaces.Dict(cam_intrinsic_spaces)
+                obs_space["camera_extrinsics"] = spaces.Dict(cam_extrinsic_spaces)
             self.observation_space = spaces.Dict(obs_space)
         elif self.obs_type == "pixels_agent_pos":
             obs_space = {
@@ -267,6 +282,8 @@ class LiberoEnv(gym.Env):
             }
             if self.use_depth and depths:
                 obs_space["depths"] = spaces.Dict(depths)
+                obs_space["camera_intrinsics"] = spaces.Dict(cam_intrinsic_spaces)
+                obs_space["camera_extrinsics"] = spaces.Dict(cam_extrinsic_spaces)
             self.observation_space = spaces.Dict(obs_space)
 
         self.action_space = spaces.Box(
@@ -300,28 +317,6 @@ class LiberoEnv(gym.Env):
                 depth_rgb = np.stack([depth_vis, depth_vis, depth_vis], axis=-1)
                 # Concatenate horizontally: [RGB | Depth]
                 image = np.concatenate([image, depth_rgb], axis=1)
-
-        # If point cloud encoder is active, add point cloud projection to the right
-        if self.use_depth:
-            try:
-                from lerobot.policies.groot.dgcnn_encoder import (
-                    _point_cloud_cache,
-                    render_point_cloud_projections,
-                )
-                if _point_cloud_cache is not None:
-                    voxel_img = render_point_cloud_projections(_point_cloud_cache, scale=1)
-                    # Resize voxel image to match the height of the render
-                    h_target = image.shape[0]
-                    h_vox, w_vox = voxel_img.shape[:2]
-                    if h_vox != h_target:
-                        from PIL import Image as _PILImage
-                        w_new = int(w_vox * h_target / h_vox)
-                        voxel_img = np.array(
-                            _PILImage.fromarray(voxel_img).resize((w_new, h_target), _PILImage.NEAREST)
-                        )
-                    image = np.concatenate([image, voxel_img], axis=1)
-            except Exception:
-                pass  # visualization is best-effort
 
         return image
 
@@ -449,34 +444,44 @@ class LiberoEnv(gym.Env):
         if self.use_depth:
             obs["depths"] = depths
 
-        # Extract camera intrinsics/extrinsics for voxel encoder
+        # Extract per-camera intrinsics/extrinsics for DGCNN point cloud encoder.
+        # Keys use the *mapped* camera name (e.g. "front", "wrist") so that
+        # preprocess_observation can emit observation.camera.{name}.intrinsics —
+        # the format GrootPackInputsStep expects.
         if self.use_depth:
             sim = self._env.env.sim
-            cam_name_base = self.camera_name[0].replace("_image", "")
-            cam_id = sim.model.camera_name2id(cam_name_base)
+            camera_params: dict[str, dict[str, np.ndarray]] = {}
+            for raw_cam in self.camera_name:
+                cam_base = raw_cam.replace("_image", "")
+                cam_id = sim.model.camera_name2id(cam_base)
 
-            # Intrinsics from FOV
-            fovy = sim.model.cam_fovy[cam_id]
-            f = (self.observation_height / 2.0) / np.tan(np.radians(fovy) / 2.0)
-            cx = self.observation_width / 2.0
-            cy = self.observation_height / 2.0
-            intrinsics = np.array([
-                [f,  0, cx],
-                [0,  f, cy],
-                [0,  0,  1],
-            ], dtype=np.float32)
+                # Intrinsics from FOV
+                fovy = sim.model.cam_fovy[cam_id]
+                f = (self.observation_height / 2.0) / np.tan(np.radians(fovy) / 2.0)
+                cx = self.observation_width / 2.0
+                cy = self.observation_height / 2.0
+                K = np.array([
+                    [f,  0, cx],
+                    [0,  f, cy],
+                    [0,  0,  1],
+                ], dtype=np.float32)
 
-            # Extrinsics (per-frame, handles dynamic cameras)
-            # Store as [R_cam_to_world | cam_pos] to match training format
-            # from replay.py's get_camera_params().
-            cam_pos = sim.data.cam_xpos[cam_id].copy()
-            R_cam_to_world = sim.data.cam_xmat[cam_id].reshape(3, 3).copy()
-            extrinsics = np.eye(4, dtype=np.float32)
-            extrinsics[:3, :3] = R_cam_to_world
-            extrinsics[:3, 3] = cam_pos
+                # Extrinsics (per-frame, handles dynamic cameras)
+                # Store as [R_cam_to_world | cam_pos] to match training format
+                # from replay.py's get_camera_params().
+                cam_pos = sim.data.cam_xpos[cam_id].copy()
+                R_cam_to_world = sim.data.cam_xmat[cam_id].reshape(3, 3).copy()
+                E = np.eye(4, dtype=np.float32)
+                E[:3, :3] = R_cam_to_world
+                E[:3, 3] = cam_pos
 
-            obs["camera_intrinsics"] = intrinsics
-            obs["camera_extrinsics"] = extrinsics
+                mapped = self.camera_name_mapping[raw_cam]  # e.g. "front"
+                camera_params[mapped] = {"intrinsics": K, "extrinsics": E}
+
+            # Store as flat dicts (matching observation_space) so SyncVectorEnv
+            # can stack them across sub-envs.
+            obs["camera_intrinsics"] = {m: p["intrinsics"] for m, p in camera_params.items()}
+            obs["camera_extrinsics"] = {m: p["extrinsics"] for m, p in camera_params.items()}
 
         # images['image'].shape --> (256, 256, 3), uint8
         # images['image.depth'].shape --> (256, 256), millimeters as uint16
@@ -486,7 +491,6 @@ class LiberoEnv(gym.Env):
             result = {"pixels": images.copy()}
             if self.use_depth:
                 result["depths"] = depths.copy()
-            if self.use_depth:
                 result["camera_intrinsics"] = obs["camera_intrinsics"]
                 result["camera_extrinsics"] = obs["camera_extrinsics"]
             return result

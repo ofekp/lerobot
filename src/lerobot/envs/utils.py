@@ -126,6 +126,17 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
             env_state = env_state.unsqueeze(0)
         return_observations[OBS_ENV_STATE] = env_state
 
+    # Per-camera intrinsics / extrinsics (used by DGCNN point cloud encoder)
+    # Stored as flat dicts: camera_intrinsics={"front": (3,3), ...}
+    for param_name in ("intrinsics", "extrinsics"):
+        key = f"camera_{param_name}"
+        if key in observations:
+            for cam_name, arr in observations[key].items():
+                t = torch.from_numpy(arr).float() if isinstance(arr, np.ndarray) else torch.as_tensor(arr).float()
+                if t.dim() == 2:
+                    t = t.unsqueeze(0)  # add batch dim
+                return_observations[f"observation.camera.{cam_name}.{param_name}"] = t
+
     if "agent_pos" in observations:
         agent_pos = torch.from_numpy(observations["agent_pos"]).float()
         if agent_pos.dim() == 1:
