@@ -128,6 +128,13 @@ def update_policy(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
 
+    # Log CHNet gradient norms before they are zeroed (diagnostics)
+    _unwrapped = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    if hasattr(_unwrapped, "_diagnostics") and _unwrapped._diagnostics is not None:
+        # step count is tracked internally by the diagnostics module via _depth_fwd_count
+        _fwd_count = getattr(_unwrapped._groot_model.backbone, '_depth_fwd_count', 0)
+        _unwrapped._diagnostics.log_gradients(_fwd_count, _unwrapped._groot_model)
+
     # Optimizer step
     with lock if lock is not None else nullcontext():
         optimizer.step()
