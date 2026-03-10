@@ -929,7 +929,9 @@ class GrootEagleCollateStep(ProcessorStep):
 
             epv = comp["eagle_pixel_values"]  # (N, C, H, W)
             rgb_pv = epv[:, :3]  # (N, 3, H, W)
-            depth_pv = epv[:, 3:4] if epv.shape[1] == 4 else None  # (N, 1, H, W) or None
+            # CHNet mode: depth is stored separately in eagle_depth_normalized
+            # Legacy 4-channel mode: depth is the 4th channel of pixel_values
+            depth_pv = comp.get("eagle_depth_normalized") if comp.get("eagle_depth_normalized") is not None else (epv[:, 3:4] if epv.shape[1] == 4 else None)
 
             save_observation_mosaic(
                 rgb_pixel_values=rgb_pv,
