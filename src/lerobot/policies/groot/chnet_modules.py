@@ -241,9 +241,8 @@ class DepthCrossAttentionFusion(nn.Module):
             embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
         )
         # Zero-init output projection so depth branch starts as identity.
-        # Without this, random cross-attention output adds ~50% noise to
-        # pretrained eagle features, destabilizing training and causing
-        # encoder gradient collapse.
+        # Combined with pre-norm residual (x + norm(attn_out)), this ensures
+        # change_ratio starts near 0 and depth signal blends in gradually.
         nn.init.zeros_(self.cross_attn.out_proj.weight)
         nn.init.zeros_(self.cross_attn.out_proj.bias)
         self.norm = nn.LayerNorm(hidden_dim)
@@ -294,7 +293,7 @@ class DepthCrossAttentionFusion(nn.Module):
                 need_weights=True,
                 average_attn_weights=False,  # keep per-head weights
             )
-            enriched_image = self.norm(image_tokens + attn_out)
+            enriched_image = image_tokens + self.norm(attn_out)
             if text_tokens is not None:
                 result = torch.cat([enriched_image, text_tokens], dim=1)
             else:
@@ -306,7 +305,7 @@ class DepthCrossAttentionFusion(nn.Module):
                 key=depth_tokens,
                 value=depth_tokens,
             )
-            enriched_image = self.norm(image_tokens + attn_out)
+            enriched_image = image_tokens + self.norm(attn_out)
             if text_tokens is not None:
                 return torch.cat([enriched_image, text_tokens], dim=1)
             return enriched_image
