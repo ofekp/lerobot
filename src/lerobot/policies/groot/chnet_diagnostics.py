@@ -393,6 +393,10 @@ class DepthDiagnostics:
             ("proximity_direction", self._viz_proximity_direction),
             ("token_space_pca", self._viz_token_space_pca),
             ("nearest_neighbors", self._viz_nearest_neighbors),
+            ("eagle_token_heatmap", self._viz_eagle_token_heatmap),
+            ("depth_token_heatmap", self._viz_depth_token_heatmap),
+            ("fastguide_pyramid", self._viz_fastguide_pyramid),
+            ("reshape_verification", self._viz_reshape_verification),
         ]
 
         for name, method in viz_methods:
@@ -469,7 +473,13 @@ class DepthDiagnostics:
             entropy = -(attn_probs * attn_probs.log()).sum(dim=-1).mean().item()
             max_entropy = np.log(attn_b0.shape[-1])
             entropy_ratio = entropy / max_entropy if max_entropy > 0 else 0.0
-            lines.append(f"  attn_entropy      : {entropy:.3f} / {max_entropy:.3f} (ratio={entropy_ratio:.3f})")
+            n_image_tokens = self._collected.get("n_image_tokens")
+            num_views_h = self._collected.get("num_views", 1)
+            lines.append(
+                f"  attn_entropy      : {entropy:.3f} / {max_entropy:.3f} "
+                f"(ratio={entropy_ratio:.3f}, Q={attn_b0.shape[1]} img tokens, "
+                f"K={attn_b0.shape[2]} depth tokens = {num_views_h}x7x7)"
+            )
             if entropy_ratio > 0.95:
                 lines.append("  !! WARNING: attention is near-uniform — depth tokens not discriminated!")
             elif entropy_ratio < 0.1:
@@ -637,12 +647,18 @@ class DepthDiagnostics:
         axes = np.array(axes).flatten()
         fig.suptitle("Cross-Attention Weights (Q=eagle, K/V=depth)", fontsize=10)
 
+        n_image_tokens = self._collected.get("n_image_tokens")
+        num_views = self._collected.get("num_views", 1)
+
         for h in range(n_heads):
             ax = axes[h]
             im = ax.imshow(attn_b0[h].numpy(), aspect="auto", cmap="hot")
             ax.set_title(f"Head {h}", fontsize=8)
-            ax.set_xlabel("depth token", fontsize=7)
-            ax.set_ylabel("eagle token", fontsize=7)
+            ax.set_xlabel(f"depth token ({num_views}x7x7)", fontsize=7)
+            if n_image_tokens:
+                ax.set_ylabel(f"image token ({n_image_tokens})", fontsize=7)
+            else:
+                ax.set_ylabel("eagle token", fontsize=7)
             fig.colorbar(im, ax=ax, fraction=0.046)
 
         # Hide unused axes
@@ -707,10 +723,16 @@ class DepthDiagnostics:
             return None
 
         # First batch, subsample tokens for readability
-        max_tokens = 64
+        n_image_tokens = self._collected.get("n_image_tokens")
+        if n_image_tokens:
+            max_tokens = min(64, n_image_tokens)
+        else:
+            max_tokens = 64
         d = depth_tok[0][:max_tokens]   # (N_d, D)
         eb = eagle_before[0][:max_tokens]  # (N_e, D)
         ea = eagle_after[0][:max_tokens]
+
+        token_label = f"image token (first {max_tokens})" if n_image_tokens else "eagle token"
 
         # Normalize
         d_norm = d / (d.norm(dim=-1, keepdim=True) + 1e-8)
@@ -726,13 +748,13 @@ class DepthDiagnostics:
         im1 = ax1.imshow(sim_before, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
         ax1.set_title("BEFORE fusion", fontsize=9)
         ax1.set_xlabel("depth token")
-        ax1.set_ylabel("eagle token")
+        ax1.set_ylabel(token_label)
         fig.colorbar(im1, ax=ax1, fraction=0.046)
 
         im2 = ax2.imshow(sim_after, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
         ax2.set_title("AFTER fusion", fontsize=9)
         ax2.set_xlabel("depth token")
-        ax2.set_ylabel("eagle token")
+        ax2.set_ylabel(token_label)
         fig.colorbar(im2, ax=ax2, fraction=0.046)
 
         path = step_dir / "embedding_similarity.png"
@@ -796,15 +818,13 @@ class DepthDiagnostics:
 
         # Attention overlaid on depth
         if has_attn:
-            # Average attention over heads and eagle tokens -> per-depth-token map
-            attn_avg = attn[0].mean(dim=0).mean(dim=0).numpy()  # (seq_kv,)
-            side = int(np.sqrt(attn_avg.shape[0]))
-            if side * side == attn_avg.shape[0]:
-                attn_map = attn_avg.reshape(side, side)
-            else:
-                attn_map = attn_avg.reshape(1, -1)
+            num_views = self._collected.get("num_views", 1)
+            attn_avg = attn[0].mean(dim=0).mean(dim=0).numpy()  # (num_views * 49,)
+            tokens_per_view = 49
+            depth_h, depth_w = 7, 7
+            view_attn = attn_avg[:tokens_per_view]  # first view
+            attn_map = view_attn.reshape(depth_h, depth_w)
 
-            # Resize to depth size
             if _HAS_PIL:
                 attn_img = PILImage.fromarray(
                     (attn_map / (attn_map.max() + 1e-8) * 255).astype(np.uint8)
@@ -812,11 +832,11 @@ class DepthDiagnostics:
                 attn_img = attn_img.resize((depth_2d.shape[1], depth_2d.shape[0]), PILImage.BILINEAR)
                 attn_resized = np.array(attn_img).astype(np.float32) / 255.0
             else:
-                attn_resized = attn_map  # fallback: no resize
+                attn_resized = attn_map
 
             axes[col].imshow(depth_2d, cmap="viridis", alpha=0.6)
             axes[col].imshow(attn_resized, cmap="hot", alpha=0.4)
-            axes[col].set_title("Attention on Depth", fontsize=9)
+            axes[col].set_title("Attention on Depth (view 0)", fontsize=9)
 
         path = step_dir / "input_overlay.png"
         self._save_fig(fig, path)
@@ -855,14 +875,24 @@ class DepthDiagnostics:
             fontsize=9,
         )
 
-        # Also try spatial view if token count is a perfect square
-        side = int(np.sqrt(len(magnitudes)))
-        if side * side == len(magnitudes):
-            fig2, ax2 = plt.subplots(1, 1, figsize=(5, 5))
-            im = ax2.imshow(magnitudes.reshape(side, side), cmap="magma")
-            ax2.set_title("Depth Contribution (spatial)", fontsize=9)
-            fig2.colorbar(im, ax=ax2)
-            self._save_fig(fig2, step_dir / "depth_contribution_spatial.png")
+        # Spatial view using proper grid dimensions
+        grid_h = self._collected.get("grid_h")
+        grid_w = self._collected.get("grid_w")
+        num_views = self._collected.get("num_views", 1)
+        n_image_tokens = self._collected.get("n_image_tokens")
+
+        if grid_h and grid_w and n_image_tokens:
+            img_magnitudes = magnitudes[:n_image_tokens]
+            tokens_per_view = grid_h * grid_w
+            for v in range(num_views):
+                start = v * tokens_per_view
+                end = start + tokens_per_view
+                if end <= len(img_magnitudes):
+                    fig_v, ax_v = plt.subplots(1, 1, figsize=(5, 5))
+                    im = ax_v.imshow(img_magnitudes[start:end].reshape(grid_h, grid_w), cmap="magma")
+                    ax_v.set_title(f"Depth Contribution (view {v}, {grid_h}x{grid_w})", fontsize=9)
+                    fig_v.colorbar(im, ax=ax_v)
+                    self._save_fig(fig_v, step_dir / f"depth_contribution_spatial_view{v}.png")
 
         path = step_dir / "depth_contribution_map.png"
         self._save_fig(fig, path)
@@ -1101,6 +1131,312 @@ class DepthDiagnostics:
                            "Gray arrows show which eagle token is most similar to each depth token.",
             "expect": "Arrows pointing to spatially/semantically similar eagle tokens; some clustering.",
             "concern_if": "All arrows converge to a single eagle token (degenerate fusion).",
+        }
+
+    # ------------------------------------------------------------------
+    # 9. Eagle token heatmap over RGB
+    # ------------------------------------------------------------------
+    def _viz_eagle_token_heatmap(self, step_dir):
+        """Per-view heatmap of eagle image token depth-contribution overlaid on RGB."""
+        eagle_before = self._collected.get("eagle_before")
+        eagle_after = self._collected.get("eagle_after")
+        rgb_pixels = self._collected.get("rgb_pixels")
+        grid_h = self._collected.get("grid_h")
+        grid_w = self._collected.get("grid_w")
+        num_views = self._collected.get("num_views", 1)
+        n_image_tokens = self._collected.get("n_image_tokens")
+
+        if eagle_before is None or eagle_after is None:
+            return None
+        if grid_h is None or grid_w is None or n_image_tokens is None:
+            return None
+
+        diff = eagle_after[0] - eagle_before[0]  # (seq, D)
+        magnitudes = diff.norm(dim=-1).numpy()    # (seq,)
+
+        tokens_per_view = grid_h * grid_w
+        saved_files = []
+
+        for v in range(num_views):
+            start = v * tokens_per_view
+            end = start + tokens_per_view
+            if end > n_image_tokens:
+                break
+
+            heatmap = magnitudes[start:end].reshape(grid_h, grid_w)
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            fig.suptitle(f"Eagle Token Depth Contribution Heatmap (view {v})", fontsize=10)
+
+            # Left: RGB
+            if rgb_pixels is not None and v < rgb_pixels.shape[0]:
+                rgb_np = rgb_pixels[v].permute(1, 2, 0).numpy()
+                rgb_np = np.clip(rgb_np, 0, 1) if rgb_np.max() <= 1.0 else np.clip(rgb_np / 255.0, 0, 1)
+                axes[0].imshow(rgb_np)
+                axes[0].set_title("RGB", fontsize=9)
+            else:
+                axes[0].text(0.5, 0.5, "RGB not available", ha="center", va="center",
+                             transform=axes[0].transAxes)
+                axes[0].set_title("RGB (N/A)", fontsize=9)
+
+            # Right: heatmap overlaid on RGB
+            if rgb_pixels is not None and v < rgb_pixels.shape[0]:
+                rgb_np = rgb_pixels[v].permute(1, 2, 0).numpy()
+                rgb_np = np.clip(rgb_np, 0, 1) if rgb_np.max() <= 1.0 else np.clip(rgb_np / 255.0, 0, 1)
+                axes[1].imshow(rgb_np, alpha=0.6)
+
+                if _HAS_PIL:
+                    h_img = PILImage.fromarray(
+                        (heatmap / (heatmap.max() + 1e-8) * 255).astype(np.uint8)
+                    )
+                    rgb_h, rgb_w = rgb_np.shape[:2]
+                    h_img = h_img.resize((rgb_w, rgb_h), PILImage.BILINEAR)
+                    heatmap_resized = np.array(h_img).astype(np.float32) / 255.0
+                    im = axes[1].imshow(heatmap_resized, cmap="hot", alpha=0.4)
+                else:
+                    im = axes[1].imshow(heatmap, cmap="hot", alpha=0.4)
+            else:
+                im = axes[1].imshow(heatmap, cmap="hot")
+
+            axes[1].set_title(f"Depth Contribution ({grid_h}x{grid_w})", fontsize=9)
+            fig.colorbar(im, ax=axes[1], fraction=0.046)
+
+            fname = f"eagle_token_heatmap_view{v}.png"
+            self._save_fig(fig, step_dir / fname)
+            saved_files.append(fname)
+
+        if not saved_files:
+            return None
+
+        return {
+            "file": saved_files[0],
+            "what": "Per-view heatmap of eagle image token depth-contribution (L2 of delta before/after fusion) overlaid on RGB.",
+            "how_to_read": "Bright regions = image tokens most modified by CHNet depth fusion. "
+                           "Overlaid on RGB for spatial context. One file per view.",
+            "expect": "Contributions concentrated on task-relevant objects or depth-salient regions.",
+            "concern_if": "Uniform heatmap (CHNet not differentially modifying tokens) or all zeros.",
+        }
+
+    # ------------------------------------------------------------------
+    # 10. Depth token heatmap over depth
+    # ------------------------------------------------------------------
+    def _viz_depth_token_heatmap(self, step_dir):
+        """Per-view heatmap of attention received by each depth token overlaid on depth image."""
+        attn = self._collected.get("attn_weights")
+        depth_input = self._collected.get("depth_input")
+        num_views = self._collected.get("num_views", 1)
+
+        if attn is None or depth_input is None:
+            return None
+
+        # attn: (B, heads, n_image_q, num_views*49)
+        # Sum over Q (image tokens) and average over heads to get attention received per depth token
+        attn_received = attn[0].mean(dim=0).sum(dim=0).numpy()  # (num_views*49,)
+
+        saved_files = []
+
+        for v in range(num_views):
+            start = v * 49
+            end = start + 49
+            if end > len(attn_received):
+                break
+
+            attn_map = attn_received[start:end].reshape(7, 7)
+
+            # Get depth image for this view
+            depth_idx = v if v < depth_input.shape[0] else 0
+            depth_2d = depth_input[depth_idx, 0].numpy()
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            fig.suptitle(f"Depth Token Attention Heatmap (view {v})", fontsize=10)
+
+            # Left: depth image
+            axes[0].imshow(depth_2d, cmap="viridis")
+            axes[0].set_title(
+                f"Depth (viridis)\nrange: [{depth_2d.min():.2f}, {depth_2d.max():.2f}]",
+                fontsize=9,
+            )
+
+            # Right: attention overlaid on depth
+            axes[1].imshow(depth_2d, cmap="viridis", alpha=0.6)
+            if _HAS_PIL:
+                a_img = PILImage.fromarray(
+                    (attn_map / (attn_map.max() + 1e-8) * 255).astype(np.uint8)
+                )
+                a_img = a_img.resize((depth_2d.shape[1], depth_2d.shape[0]), PILImage.BILINEAR)
+                attn_resized = np.array(a_img).astype(np.float32) / 255.0
+                im = axes[1].imshow(attn_resized, cmap="hot", alpha=0.4)
+            else:
+                im = axes[1].imshow(attn_map, cmap="hot", alpha=0.4)
+            axes[1].set_title("Attention Received (7x7)", fontsize=9)
+            fig.colorbar(im, ax=axes[1], fraction=0.046)
+
+            fname = f"depth_token_heatmap_view{v}.png"
+            self._save_fig(fig, step_dir / fname)
+            saved_files.append(fname)
+
+        if not saved_files:
+            return None
+
+        return {
+            "file": saved_files[0],
+            "what": "Per-view heatmap of attention received by each depth token (summed over image Q tokens), overlaid on depth image.",
+            "how_to_read": "Bright 7x7 regions overlaid on depth = depth tokens that are most attended to by image tokens. "
+                           "One file per view.",
+            "expect": "Attention concentrated on depth patches with salient geometry (objects, edges).",
+            "concern_if": "Uniform attention (depth tokens equally attended = depth not discriminated) or single hot spot.",
+        }
+
+    # ------------------------------------------------------------------
+    # 11. FastGuide pyramid
+    # ------------------------------------------------------------------
+    def _viz_fastguide_pyramid(self, step_dir):
+        """3-row x 4-col grid: ViT projected, depth CNN, and FastGuide attention per stage."""
+        vit_projected = self._collected.get("vit_projected")
+        depth_stages = self._collected.get("depth_stages")
+        fg_attns = self._collected.get("fastguide_attns")
+
+        if vit_projected is None and depth_stages is None and fg_attns is None:
+            return None
+
+        n_stages = 4
+        stage_sizes = [56, 28, 14, 7]
+
+        fig, axes = plt.subplots(3, n_stages, figsize=(4 * n_stages, 12))
+        fig.suptitle("FastGuide Pyramid (Row 0: ViT projected, Row 1: Depth CNN, Row 2: FastGuide attn)", fontsize=10)
+
+        row_labels = ["ViT projected", "Depth CNN", "FastGuide attn"]
+        for row in range(3):
+            axes[row, 0].set_ylabel(row_labels[row], fontsize=9)
+
+        for stage_idx in range(n_stages):
+            sz = stage_sizes[stage_idx]
+
+            # Row 0: ViT projected features (channel-mean magnitude, first view)
+            ax0 = axes[0, stage_idx]
+            if vit_projected is not None and stage_idx < len(vit_projected):
+                feat = vit_projected[stage_idx]  # (B*num_views, C, H, W)
+                feat_view0 = feat[0]  # (C, H, W)
+                mag = feat_view0.abs().mean(dim=0).numpy()  # (H, W)
+                im0 = ax0.imshow(mag, cmap="viridis")
+                ax0.set_title(f"Stage {stage_idx + 1} ({sz}x{sz})", fontsize=8)
+                fig.colorbar(im0, ax=ax0, fraction=0.046)
+            else:
+                ax0.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax0.transAxes)
+                ax0.set_title(f"Stage {stage_idx + 1} ({sz}x{sz})", fontsize=8)
+
+            # Row 1: Depth CNN features (channel-mean magnitude, first view)
+            ax1 = axes[1, stage_idx]
+            if depth_stages is not None and stage_idx < len(depth_stages):
+                dfeat = depth_stages[stage_idx]  # (B*num_views, C, H, W)
+                dfeat_view0 = dfeat[0]  # (C, H, W)
+                dmag = dfeat_view0.abs().mean(dim=0).numpy()  # (H, W)
+                im1 = ax1.imshow(dmag, cmap="inferno")
+                fig.colorbar(im1, ax=ax1, fraction=0.046)
+            else:
+                ax1.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax1.transAxes)
+
+            # Row 2: FastGuide attention (first view)
+            ax2 = axes[2, stage_idx]
+            if fg_attns is not None and stage_idx < len(fg_attns):
+                fg = fg_attns[stage_idx]  # (B*num_views, 1, H, W)
+                fg_view0 = fg[0, 0].numpy()  # (H, W)
+                im2 = ax2.imshow(fg_view0, cmap="hot")
+                fig.colorbar(im2, ax=ax2, fraction=0.046)
+            else:
+                ax2.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax2.transAxes)
+
+        path = step_dir / "fastguide_pyramid.png"
+        self._save_fig(fig, path)
+
+        return {
+            "file": "fastguide_pyramid.png",
+            "what": "3-row x 4-col pyramid: ViT projected features, depth CNN features, and FastGuide spatial attention at each of 4 stages (56, 28, 14, 7).",
+            "how_to_read": "Row 0: ViT feature magnitudes (channel mean). Row 1: Depth CNN feature magnitudes (channel mean). "
+                           "Row 2: FastGuide attention maps. First view only. Columns = stages 1-4.",
+            "expect": "ViT and depth features have matching spatial patterns; FastGuide focuses on relevant regions.",
+            "concern_if": "ViT features look random or depth CNN features are all zero (no gradient signal).",
+        }
+
+    # ------------------------------------------------------------------
+    # 12. Reshape verification
+    # ------------------------------------------------------------------
+    def _viz_reshape_verification(self, step_dir):
+        """Per-view panel to verify ViT feature reshape is spatially correct."""
+        vit_projected = self._collected.get("vit_projected")
+        rgb_pixels = self._collected.get("rgb_pixels")
+        depth_input = self._collected.get("depth_input")
+        num_views = self._collected.get("num_views", 1)
+
+        if vit_projected is None:
+            return None
+        if len(vit_projected) < 4:
+            return None
+
+        saved_files = []
+
+        for v in range(num_views):
+            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+            fig.suptitle(f"Reshape Verification (view {v})", fontsize=10)
+
+            # Col 0: RGB image
+            ax = axes[0]
+            if rgb_pixels is not None and v < rgb_pixels.shape[0]:
+                rgb_np = rgb_pixels[v].permute(1, 2, 0).numpy()
+                rgb_np = np.clip(rgb_np, 0, 1) if rgb_np.max() <= 1.0 else np.clip(rgb_np / 255.0, 0, 1)
+                ax.imshow(rgb_np)
+                ax.set_title("RGB (ground truth)", fontsize=9)
+            else:
+                ax.text(0.5, 0.5, "RGB N/A", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title("RGB (N/A)", fontsize=9)
+
+            # Col 1: ViT features at stage 0 (56x56, upsampled from 16x16)
+            ax = axes[1]
+            feat0 = vit_projected[0]  # (B*num_views, C, H, W)
+            view_idx = v if v < feat0.shape[0] else 0
+            mag0 = feat0[view_idx].abs().mean(dim=0).numpy()
+            im1 = ax.imshow(mag0, cmap="viridis")
+            ax.set_title(f"ViT stage 1 ({mag0.shape[0]}x{mag0.shape[1]})", fontsize=9)
+            fig.colorbar(im1, ax=ax, fraction=0.046)
+
+            # Col 2: ViT features at stage 3 (7x7, native)
+            ax = axes[2]
+            feat3 = vit_projected[3]  # (B*num_views, C, H, W)
+            view_idx3 = v if v < feat3.shape[0] else 0
+            mag3 = feat3[view_idx3].abs().mean(dim=0).numpy()
+            im2 = ax.imshow(mag3, cmap="viridis")
+            ax.set_title(f"ViT stage 4 ({mag3.shape[0]}x{mag3.shape[1]}, native)", fontsize=9)
+            fig.colorbar(im2, ax=ax, fraction=0.046)
+
+            # Col 3: Depth image (reference)
+            ax = axes[3]
+            if depth_input is not None:
+                depth_idx = v if v < depth_input.shape[0] else 0
+                depth_2d = depth_input[depth_idx, 0].numpy()
+                im3 = ax.imshow(depth_2d, cmap="viridis")
+                ax.set_title(
+                    f"Depth (ref)\nrange: [{depth_2d.min():.2f}, {depth_2d.max():.2f}]",
+                    fontsize=9,
+                )
+                fig.colorbar(im3, ax=ax, fraction=0.046)
+            else:
+                ax.text(0.5, 0.5, "Depth N/A", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title("Depth (N/A)", fontsize=9)
+
+            fname = f"reshape_verification_view{v}.png"
+            self._save_fig(fig, step_dir / fname)
+            saved_files.append(fname)
+
+        if not saved_files:
+            return None
+
+        return {
+            "file": saved_files[0],
+            "what": "Per-view panel: RGB | ViT stage-1 features (56x56) | ViT stage-4 features (7x7) | depth image.",
+            "how_to_read": "If reshape is correct, spatial patterns in ViT feature maps should match RGB structure. "
+                           "Stage-1 (col 1) is upsampled from 16x16 ViT patches; stage-4 (col 2) is at native 7x7 resolution.",
+            "expect": "ViT feature spatial patterns (edges, objects) align with RGB image structure.",
+            "concern_if": "ViT features look random or have no correlation with RGB spatial structure (reshape is wrong).",
         }
 
     # ------------------------------------------------------------------
