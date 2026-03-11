@@ -382,7 +382,9 @@ class EagleBackbone(nn.Module):
         if not tune_visual:
             self.eagle_model.vision_model.requires_grad_(False)
             self.eagle_model.mlp1.requires_grad_(False)
-        #Ofek please double check me here, I think I just cancelled training the DiT
+        # CHNet params live inside the backbone but must stay trainable even when
+        # vision_model and LLM are frozen. DiT trainability is handled separately
+        # by the action_head's set_trainable_parameters — not affected here.
         for name, p in self.named_parameters():
             if 'chnet' in name:
                 p.requires_grad = True
@@ -547,11 +549,23 @@ class EagleBackbone(nn.Module):
                 raise RuntimeError(
                     "[GROOT] CHNet output is all zeros! Cross-attention fusion produced empty features."
                 )
+            # Zero-init on cross-attention out_proj means diff is exactly 0 before
+            # the first optimizer step. Only raise after enough steps for gradients
+            # to have updated the weights (batch_size steps ≈ 1 optimizer step).
+            _WARMUP_STEPS = 50
             if diff_norm == 0.0:
-                raise RuntimeError(
-                    "[GROOT] CHNet did not change eagle_features at all! "
-                    "Cross-attention residual is zero — depth signal is not being fused."
-                )
+                if self._depth_fwd_count <= _WARMUP_STEPS:
+                    if self._depth_fwd_count == 1:
+                        print(
+                            f"[GROOT] CHNet change_ratio = 0.0 on step {self._depth_fwd_count} "
+                            f"(expected with zero-init, will become non-zero after first optimizer step)"
+                        )
+                else:
+                    raise RuntimeError(
+                        f"[GROOT] CHNet did not change eagle_features after {self._depth_fwd_count} steps! "
+                        "Cross-attention residual is still zero — depth signal is not being fused. "
+                        "Check that CHNet parameters are receiving gradients."
+                    )
 
         eagle_features = self.eagle_linear(eagle_features)
         return eagle_features, eagle_input["attention_mask"]
