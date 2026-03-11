@@ -182,11 +182,15 @@ class DepthCNNEncoder(nn.Module):
             If return_diagnostics: tuple of (depth_features, fastguide_attns)
         """
         fastguide_attns = [] if return_diagnostics else None
+        vit_projected = [] if return_diagnostics else None
+        depth_stages = [] if return_diagnostics else None
         x = self.stem(depth)
 
         x = self.stage1(x)
         rgb1 = self.proj1(vit_features[0], grid_h, grid_w)
         if return_diagnostics:
+            depth_stages.append(x.clone())
+            vit_projected.append(rgb1)
             x, attn = self.guide1(x, rgb1, return_diagnostics=True)
             fastguide_attns.append(attn)
         else:
@@ -195,6 +199,8 @@ class DepthCNNEncoder(nn.Module):
         x = self.stage2(x)
         rgb2 = self.proj2(vit_features[1], grid_h, grid_w)
         if return_diagnostics:
+            depth_stages.append(x.clone())
+            vit_projected.append(rgb2)
             x, attn = self.guide2(x, rgb2, return_diagnostics=True)
             fastguide_attns.append(attn)
         else:
@@ -203,6 +209,8 @@ class DepthCNNEncoder(nn.Module):
         x = self.stage3(x)
         rgb3 = self.proj3(vit_features[2], grid_h, grid_w)
         if return_diagnostics:
+            depth_stages.append(x.clone())
+            vit_projected.append(rgb3)
             x, attn = self.guide3(x, rgb3, return_diagnostics=True)
             fastguide_attns.append(attn)
         else:
@@ -211,13 +219,15 @@ class DepthCNNEncoder(nn.Module):
         x = self.stage4(x)
         rgb4 = self.proj4(vit_features[3], grid_h, grid_w)
         if return_diagnostics:
+            depth_stages.append(x.clone())
+            vit_projected.append(rgb4)
             x, attn = self.guide4(x, rgb4, return_diagnostics=True)
             fastguide_attns.append(attn)
         else:
             x = self.guide4(x, rgb4)
 
         if return_diagnostics:
-            return x, fastguide_attns
+            return x, fastguide_attns, vit_projected, depth_stages
         return x
 
 
@@ -232,18 +242,22 @@ class DepthCrossAttentionFusion(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, eagle_features, depth_features, return_diagnostics=False):
+    def forward(self, eagle_features, depth_features, return_diagnostics=False,
+                n_image_tokens=None):
         """
         Args:
             eagle_features: (B, seq_len, hidden_dim) from Eagle model
             depth_features: (N, C, H, W) from DepthCNNEncoder, where N = B * num_views
             return_diagnostics: if True, also return attention weights and depth tokens
+            n_image_tokens: if provided and < seq_len, only cross-attend image tokens
+                            (text tokens are passed through unchanged)
         Returns:
             (B, seq_len, hidden_dim) enriched features
             If return_diagnostics: tuple of (enriched_features, attn_weights, depth_tokens)
         """
         n, c, h, w = depth_features.shape
         b_eagle = eagle_features.shape[0]
+        seq_len = eagle_features.shape[1]
         depth_tokens = depth_features.flatten(2).transpose(1, 2)  # (N, H*W, C)
         depth_tokens = self.depth_proj(depth_tokens)  # (N, H*W, hidden_dim)
 
@@ -255,24 +269,41 @@ class DepthCrossAttentionFusion(nn.Module):
             # (B*V, T, D) -> (B, V*T, D) — each batch element attends to all its views
             depth_tokens = depth_tokens.view(b_eagle, num_views * tokens_per_view, -1)
 
-        # Cross-attention: Q=eagle, K=depth, V=depth
+        # Slice image tokens from the full eagle sequence when n_image_tokens is given.
+        # Text tokens have no spatial correspondence to depth and produce uniform
+        # attention, so we only use the image portion as Q in cross-attention.
+        if n_image_tokens is not None and n_image_tokens < seq_len:
+            image_tokens = eagle_features[:, :n_image_tokens, :]
+            text_tokens = eagle_features[:, n_image_tokens:, :]
+        else:
+            image_tokens = eagle_features
+            text_tokens = None
+
+        # Cross-attention: Q=image_tokens, K=depth, V=depth
         if return_diagnostics:
             attn_out, attn_weights = self.cross_attn(
-                query=eagle_features,
+                query=image_tokens,
                 key=depth_tokens,
                 value=depth_tokens,
                 need_weights=True,
                 average_attn_weights=False,  # keep per-head weights
             )
-            result = self.norm(eagle_features + attn_out)
+            enriched_image = self.norm(image_tokens + attn_out)
+            if text_tokens is not None:
+                result = torch.cat([enriched_image, text_tokens], dim=1)
+            else:
+                result = enriched_image
             return result, attn_weights, depth_tokens
         else:
             attn_out, _ = self.cross_attn(
-                query=eagle_features,
+                query=image_tokens,
                 key=depth_tokens,
                 value=depth_tokens,
             )
-            return self.norm(eagle_features + attn_out)
+            enriched_image = self.norm(image_tokens + attn_out)
+            if text_tokens is not None:
+                return torch.cat([enriched_image, text_tokens], dim=1)
+            return enriched_image
 
 
 class CHNetDepthProcessor(nn.Module):
@@ -291,7 +322,8 @@ class CHNetDepthProcessor(nn.Module):
             num_heads=num_heads,
         )
 
-    def forward(self, depth, vit_features, grid_h, grid_w, eagle_features, return_diagnostics=False):
+    def forward(self, depth, vit_features, grid_h, grid_w, eagle_features,
+                return_diagnostics=False, n_image_tokens=None):
         """
         Args:
             depth: (B, 1, H, W) normalized depth
@@ -299,22 +331,26 @@ class CHNetDepthProcessor(nn.Module):
             grid_h, grid_w: ViT patch grid dimensions
             eagle_features: (B, seq_len, hidden_dim) pre-projection features
             return_diagnostics: if True, also return intermediate tensors for visualization
+            n_image_tokens: if provided, only cross-attend image tokens in fusion
         Returns:
             (B, seq_len, hidden_dim) enriched features
             If return_diagnostics: tuple of (enriched_features, diagnostics_dict)
         """
         if return_diagnostics:
-            depth_feat, fastguide_attns = self.encoder(
+            depth_feat, fastguide_attns, vit_projected, depth_stages = self.encoder(
                 depth, vit_features, grid_h, grid_w, return_diagnostics=True
             )
             result, attn_weights, depth_tokens = self.fusion(
-                eagle_features, depth_feat, return_diagnostics=True
+                eagle_features, depth_feat, return_diagnostics=True,
+                n_image_tokens=n_image_tokens,
             )
             return result, {
                 "attn_weights": attn_weights,
                 "fastguide_attns": fastguide_attns,
                 "depth_tokens": depth_tokens,
+                "vit_projected": vit_projected,
+                "depth_stages": depth_stages,
             }
         else:
             depth_feat = self.encoder(depth, vit_features, grid_h, grid_w)
-            return self.fusion(eagle_features, depth_feat)
+            return self.fusion(eagle_features, depth_feat, n_image_tokens=n_image_tokens)
