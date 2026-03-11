@@ -494,6 +494,10 @@ class EagleBackbone(nn.Module):
             if self._diagnostics is not None and self._depth_fwd_count == 1:
                 self._diagnostics.verify_hooks()
 
+            # Compute spatial metadata for diagnostics and image-token slicing
+            num_views = pixel_values.shape[0] // eagle_features.shape[0] if pixel_values is not None else 1
+            n_image_tokens = num_views * grid_h * grid_w
+
             # Check if diagnostics should collect data this step
             do_diag = (self._diagnostics is not None
                        and self._diagnostics.should_report(self._depth_fwd_count, is_training=self.training))
@@ -506,6 +510,7 @@ class EagleBackbone(nn.Module):
                     grid_w=grid_w,
                     eagle_features=eagle_features,
                     return_diagnostics=True,
+                    n_image_tokens=n_image_tokens,
                 )
                 self._diagnostics.collect(
                     step=self._depth_fwd_count,
@@ -517,6 +522,12 @@ class EagleBackbone(nn.Module):
                     depth_tokens=diag_data["depth_tokens"],
                     rgb_pixels=pixel_values,
                     is_training=self.training,
+                    grid_h=grid_h,
+                    grid_w=grid_w,
+                    num_views=num_views,
+                    n_image_tokens=n_image_tokens,
+                    vit_projected=diag_data["vit_projected"],
+                    depth_stages=diag_data["depth_stages"],
                 )
                 self._diagnostics.report(self._depth_fwd_count, is_training=self.training)
             else:
@@ -526,6 +537,7 @@ class EagleBackbone(nn.Module):
                     grid_h=grid_h,
                     grid_w=grid_w,
                     eagle_features=eagle_features,
+                    n_image_tokens=n_image_tokens,
                 )
 
             # Safety checks (always active, regardless of diagnostics)

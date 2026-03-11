@@ -318,7 +318,9 @@ class DepthDiagnostics:
     # ------------------------------------------------------------------
     def collect(self, step, depth_input, eagle_features_before, eagle_features_after,
                 attn_weights=None, fastguide_attns=None, depth_tokens=None,
-                rgb_pixels=None, is_training=True):
+                rgb_pixels=None, is_training=True,
+                grid_h=None, grid_w=None, num_views=1, n_image_tokens=None,
+                vit_projected=None, depth_stages=None):
         """Collect tensors for diagnostics. All are detached to CPU float32.
 
         Args:
@@ -331,6 +333,13 @@ class DepthDiagnostics:
             depth_tokens: Optional (B, N, D) depth tokens fed to cross-attention.
             rgb_pixels: Optional (B, 3, H, W) RGB input pixels.
             is_training: Whether we are in training mode.
+            grid_h: ViT patch grid height.
+            grid_w: ViT patch grid width.
+            num_views: Number of camera views.
+            n_image_tokens: Number of image tokens in eagle sequence.
+            vit_projected: Optional list of 4 (B, C, H, W) projected ViT feature maps.
+            depth_stages: Optional list of 4 (B, C, H, W) depth CNN stage features
+                          before FastGuide.
         """
         self._collected = {
             "step": step,
@@ -342,6 +351,12 @@ class DepthDiagnostics:
             "fastguide_attns": [_safe_detach(a) for a in fastguide_attns] if fastguide_attns else None,
             "depth_tokens": _safe_detach(depth_tokens),
             "rgb_pixels": _safe_detach(rgb_pixels),
+            "grid_h": grid_h,
+            "grid_w": grid_w,
+            "num_views": num_views,
+            "n_image_tokens": n_image_tokens,
+            "vit_projected": [_safe_detach(v) for v in vit_projected] if vit_projected else None,
+            "depth_stages": [_safe_detach(d) for d in depth_stages] if depth_stages else None,
         }
 
     # ------------------------------------------------------------------
