@@ -240,6 +240,12 @@ class DepthCrossAttentionFusion(nn.Module):
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
         )
+        # Zero-init output projection so depth branch starts as identity.
+        # Without this, random cross-attention output adds ~50% noise to
+        # pretrained eagle features, destabilizing training and causing
+        # encoder gradient collapse.
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.bias)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, eagle_features, depth_features, return_diagnostics=False,

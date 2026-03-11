@@ -404,6 +404,8 @@ class DepthDiagnostics:
                 doc = method(step_dir)
                 if doc is not None:
                     index_entries.append(doc)
+                else:
+                    print(f"[CHNet Diag] Visualization '{name}' returned None (missing data)", flush=True)
             except Exception as e:
                 msg = f"[CHNet Diag] Visualization '{name}' failed: {e}"
                 print(msg, flush=True)
@@ -497,22 +499,26 @@ class DepthDiagnostics:
                     lines.append(f"    {sub_name:14s} L2 norm: {norm_val:.4f}  (expected: 1.0-50.0)")
 
             # 3. Weight drift from initial
-            lines.append("  --- Weight Drift (vs init) ---")
-            for name, param in chnet.named_parameters():
-                if name in self._initial_weights:
-                    current_norm = param.detach().cpu().float().norm().item()
-                    init_norm = self._initial_weights[name]
-                    if init_norm > 1e-8:
-                        drift_pct = abs(current_norm - init_norm) / init_norm * 100
-                    else:
-                        drift_pct = 0.0 if abs(current_norm) < 1e-8 else float("inf")
-                    # Only print top-level summary (first dot-split)
-                    if name.count(".") <= 2:
-                        lines.append(
-                            f"    {name:40s}: {drift_pct:6.2f}% drift  "
-                            f"(init={init_norm:.4f}, now={current_norm:.4f})  "
-                            f"(expected: <5% early, <20% late)"
-                        )
+            if self._collected.get("is_training", True):
+                lines.append("  --- Weight Drift (vs init) ---")
+                for name, param in chnet.named_parameters():
+                    if name in self._initial_weights:
+                        current_norm = param.detach().cpu().float().norm().item()
+                        init_norm = self._initial_weights[name]
+                        if init_norm > 1e-8:
+                            drift_pct = abs(current_norm - init_norm) / init_norm * 100
+                        else:
+                            drift_pct = 0.0 if abs(current_norm) < 1e-8 else float("inf")
+                        # Only print top-level summary (first dot-split)
+                        if name.count(".") <= 2:
+                            lines.append(
+                                f"    {name:40s}: {drift_pct:6.2f}% drift  "
+                                f"(init={init_norm:.4f}, now={current_norm:.4f})  "
+                                f"(expected: <5% early, <20% late)"
+                            )
+            else:
+                lines.append("  --- Weight Drift ---")
+                lines.append("  (skipped during eval — init snapshot is post-checkpoint)")
 
         # 4. Change ratio + trend
         if eagle_before is not None and eagle_after is not None:
@@ -540,22 +546,29 @@ class DepthDiagnostics:
         backbone = self.model
         chnet = backbone.chnet
         if chnet is not None:
-            bn_frozen_count = 0
+            bn_eval_count = 0
+            bn_stuck_count = 0
             bn_total = 0
             for name, mod in chnet.named_modules():
                 if isinstance(mod, (torch.nn.BatchNorm2d, torch.nn.BatchNorm1d)):
                     bn_total += 1
                     if not mod.training:
-                        bn_frozen_count += 1
+                        bn_eval_count += 1
                     elif mod.running_mean is not None and step > 100:
-                        # After enough steps, running_mean should have moved from init (zeros)
                         if mod.running_mean.abs().max().item() < 1e-7:
-                            bn_frozen_count += 1
-            if bn_frozen_count > 0:
+                            bn_stuck_count += 1
+            if bn_eval_count > 0:
                 lines.append(
-                    f"  !! WARNING: {bn_frozen_count}/{bn_total} BN layers appear frozen "
-                    f"(eval mode or running_mean stuck at zero)"
+                    f"  !! WARNING: {bn_eval_count}/{bn_total} BN layers in eval mode "
+                    f"— running stats won't update!"
                 )
+            if bn_stuck_count > 0:
+                lines.append(
+                    f"  !! NOTE: {bn_stuck_count}/{bn_total} BN layers have running_mean~0 "
+                    f"(may be normal for this architecture)"
+                )
+            if bn_eval_count == 0 and bn_stuck_count == 0:
+                lines.append(f"  BN layers: {bn_total} total, all in training mode, stats updating")
 
         return lines
 
@@ -569,6 +582,11 @@ class DepthDiagnostics:
             step: Current training step.
             model: The GR00TN15 model.
         """
+        # Log every step for the first 10 steps (startup debugging),
+        # then only every train_interval steps to reduce log spam.
+        if step > 10 and step % self.train_interval != 0:
+            return
+
         backbone = model.backbone
         chnet = backbone.chnet
         if chnet is None:
@@ -642,39 +660,68 @@ class DepthDiagnostics:
         # attn shape: (B, heads, seq_q, seq_kv) — take first batch
         attn_b0 = attn[0]  # (heads, seq_q, seq_kv)
         n_heads = attn_b0.shape[0]
+        num_views = self._collected.get("num_views", 1)
+        n_image_tokens = self._collected.get("n_image_tokens")
+        tokens_per_view = 49
 
+        # --- Figure 1: flat heatmap per head ---
         fig, axes = plt.subplots(2, (n_heads + 1) // 2, figsize=(3 * ((n_heads + 1) // 2), 6))
         axes = np.array(axes).flatten()
         fig.suptitle("Cross-Attention Weights (Q=eagle, K/V=depth)", fontsize=10)
 
-        n_image_tokens = self._collected.get("n_image_tokens")
-        num_views = self._collected.get("num_views", 1)
-
         for h in range(n_heads):
             ax = axes[h]
             im = ax.imshow(attn_b0[h].numpy(), aspect="auto", cmap="hot")
-            ax.set_title(f"Head {h}", fontsize=8)
-            ax.set_xlabel(f"depth token ({num_views}x7x7)", fontsize=7)
+            # Per-head entropy
+            head_attn = attn_b0[h].numpy()
+            head_entropy = -(head_attn * np.log(head_attn + 1e-10)).sum(axis=-1).mean()
+            max_ent = np.log(head_attn.shape[-1])
+            ax.set_title(f"Head {h} (ent={head_entropy / max_ent:.2f})", fontsize=7)
+            ax.set_xlabel(f"depth token ({num_views}x7x7)", fontsize=6)
             if n_image_tokens:
-                ax.set_ylabel(f"image token ({n_image_tokens})", fontsize=7)
+                ax.set_ylabel(f"image token ({n_image_tokens})", fontsize=6)
             else:
-                ax.set_ylabel("eagle token", fontsize=7)
+                ax.set_ylabel("eagle token", fontsize=6)
             fig.colorbar(im, ax=ax, fraction=0.046)
 
-        # Hide unused axes
         for i in range(n_heads, len(axes)):
             axes[i].set_visible(False)
 
-        path = step_dir / "cross_attn_map.png"
-        self._save_fig(fig, path)
+        self._save_fig(fig, step_dir / "cross_attn_map.png")
+
+        # --- Figure 2: 2D spatial attention per head (7x7) ---
+        # Average over Q dimension to get attention per depth token, reshape to 7x7
+        fig2, axes2 = plt.subplots(num_views, n_heads, figsize=(2.5 * n_heads, 3 * num_views))
+        if num_views == 1:
+            axes2 = axes2[np.newaxis, :]
+        if n_heads == 1:
+            axes2 = axes2[:, np.newaxis]
+        fig2.suptitle("Spatial Attention per Head (avg over Q, reshaped to 7x7)", fontsize=10)
+
+        for v in range(num_views):
+            start = v * tokens_per_view
+            end = start + tokens_per_view
+            if end > attn_b0.shape[2]:
+                break
+            for h in range(n_heads):
+                ax = axes2[v, h]
+                # Mean over Q, take this view's depth tokens
+                spatial = attn_b0[h].mean(dim=0).numpy()[start:end]
+                if len(spatial) == tokens_per_view:
+                    im = ax.imshow(spatial.reshape(7, 7), cmap="hot")
+                    fig2.colorbar(im, ax=ax, fraction=0.046)
+                ax.set_title(f"H{h} V{v}", fontsize=7)
+
+        self._save_fig(fig2, step_dir / "cross_attn_spatial.png")
 
         return {
             "file": "cross_attn_map.png",
-            "what": "Heatmap of cross-attention weights (Q=eagle, K/V=depth).",
+            "what": "Heatmap of cross-attention weights (Q=eagle, K/V=depth). "
+                    "Also see cross_attn_spatial.png for 2D 7x7 spatial view per head.",
             "how_to_read": "Bright spots show which depth tokens each eagle token attends to. "
-                           "Each subplot is one attention head.",
+                           "Each subplot is one attention head. Per-head entropy ratio shown in title.",
             "expect": "Structured patterns; heads specializing in different depth regions.",
-            "concern_if": "Uniform/flat attention across all heads (depth not influencing eagle).",
+            "concern_if": "Uniform/flat attention across all heads (entropy ratio near 1.0).",
         }
 
     # ------------------------------------------------------------------
@@ -825,6 +872,14 @@ class DepthDiagnostics:
             view_attn = attn_avg[:tokens_per_view]  # first view
             attn_map = view_attn.reshape(depth_h, depth_w)
 
+            # Compute entropy to detect uniform attention
+            n_tokens = len(attn_avg)
+            attn_probs = attn_avg / (attn_avg.sum() + 1e-8)
+            entropy = -(attn_probs * np.log(attn_probs + 1e-10)).sum()
+            max_entropy = np.log(n_tokens)
+            entropy_ratio = entropy / max_entropy if max_entropy > 0 else 1.0
+            is_uniform = entropy_ratio > 0.95
+
             if _HAS_PIL:
                 attn_img = PILImage.fromarray(
                     (attn_map / (attn_map.max() + 1e-8) * 255).astype(np.uint8)
@@ -836,7 +891,14 @@ class DepthDiagnostics:
 
             axes[col].imshow(depth_2d, cmap="viridis", alpha=0.6)
             axes[col].imshow(attn_resized, cmap="hot", alpha=0.4)
-            axes[col].set_title("Attention on Depth (view 0)", fontsize=9)
+
+            # Annotate with stats
+            title = "Attention on Depth (view 0)"
+            if is_uniform:
+                title += "\n!! NEAR-UNIFORM !!"
+            title += f"\nrange: [{attn_map.min():.4f}, {attn_map.max():.4f}]"
+            title += f"  entropy: {entropy_ratio:.3f}"
+            axes[col].set_title(title, fontsize=8)
 
         path = step_dir / "input_overlay.png"
         self._save_fig(fig, path)
