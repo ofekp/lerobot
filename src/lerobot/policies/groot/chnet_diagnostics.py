@@ -509,8 +509,8 @@ class DepthDiagnostics:
                             drift_pct = abs(current_norm - init_norm) / init_norm * 100
                         else:
                             drift_pct = 0.0 if abs(current_norm) < 1e-8 else float("inf")
-                        # Only print top-level summary (first dot-split)
-                        if name.count(".") <= 2:
+                        # Print top-level summary + out_proj (critical for zero-init verification)
+                        if name.count(".") <= 2 or "out_proj" in name:
                             lines.append(
                                 f"    {name:40s}: {drift_pct:6.2f}% drift  "
                                 f"(init={init_norm:.4f}, now={current_norm:.4f})  "
@@ -592,16 +592,36 @@ class DepthDiagnostics:
         if chnet is None:
             return
 
+        # --- Step 1: verify zero-init actually took effect ---
+        if step == 1:
+            out_proj = chnet.fusion.cross_attn.out_proj
+            w_norm = out_proj.weight.data.detach().float().norm().item()
+            b_norm = out_proj.bias.data.detach().float().norm().item()
+            print(
+                f"[CHNet Zero-Init Check @ step 1 BEFORE optimizer step]\n"
+                f"  out_proj.weight norm: {w_norm:.8f}  (should be 0.0)\n"
+                f"  out_proj.bias   norm: {b_norm:.8f}  (should be 0.0)\n"
+                f"  {'OK — zero-init confirmed' if w_norm < 1e-7 and b_norm < 1e-7 else '!! FAILED — weights are NOT zero, HF _no_init_weights likely overwrote them'}",
+                flush=True,
+            )
+
         lines = [f"[CHNet Gradients @ step {step}]"]
 
-        # Per named sub-module
+        # Per named sub-module (top-level summary)
         module_grads = defaultdict(list)
+        # Also collect per-param details for detailed logging
+        param_grad_details = {}
         for name, param in chnet.named_parameters():
             if param.grad is not None:
                 grad_norm = param.grad.detach().float().norm().item()
                 # Group by first component (encoder, fusion)
                 top_level = name.split(".")[0]
                 module_grads[top_level].append(grad_norm)
+                param_grad_details[name] = {
+                    "grad_norm": grad_norm,
+                    "weight_norm": param.data.detach().float().norm().item(),
+                    "grad_to_weight": grad_norm / max(param.data.detach().float().norm().item(), 1e-10),
+                }
 
         for mod_name, norms in sorted(module_grads.items()):
             if norms:
@@ -610,6 +630,35 @@ class DepthDiagnostics:
                 lines.append(
                     f"  {mod_name:14s}: mean={mean_norm:.6f}, max={max_norm:.6f}, "
                     f"n_params={len(norms)}  (expected mean: 1e-5 to 1e-1)"
+                )
+
+        # --- Detailed per-param breakdown for fusion (every train_interval or first 10 steps) ---
+        lines.append("  --- Fusion Per-Param Detail ---")
+        for name in sorted(param_grad_details.keys()):
+            if name.startswith("fusion."):
+                d = param_grad_details[name]
+                lines.append(
+                    f"    {name:45s}: grad={d['grad_norm']:.6f}, "
+                    f"weight={d['weight_norm']:.6f}, "
+                    f"grad/weight={d['grad_to_weight']:.6f}"
+                )
+
+        # --- Encoder sub-module breakdown (stages, guides, projs) ---
+        encoder_groups = defaultdict(list)
+        for name, info in param_grad_details.items():
+            if name.startswith("encoder."):
+                # Group by second component (stem, stage1, guide1, proj1, etc.)
+                parts = name.split(".")
+                group = parts[1] if len(parts) > 1 else "other"
+                encoder_groups[group].append(info["grad_norm"])
+
+        if encoder_groups:
+            lines.append("  --- Encoder Sub-Module Gradients ---")
+            for group_name in sorted(encoder_groups.keys()):
+                norms = encoder_groups[group_name]
+                lines.append(
+                    f"    {group_name:14s}: mean={sum(norms)/len(norms):.6f}, "
+                    f"max={max(norms):.6f}, n={len(norms)}"
                 )
 
         # Check for zero/missing gradients (common bug)
@@ -624,10 +673,17 @@ class DepthDiagnostics:
         if has_grad == 0:
             lines.append("  !! CRITICAL: No gradients flowing through CHNet — backward graph is broken!")
         elif zero_grad > 0:
+            # List the zero-grad params by name
+            zero_names = [
+                n for n, p in chnet.named_parameters()
+                if p.grad is not None and p.grad.abs().max().item() < 1e-12
+            ]
             lines.append(
                 f"  !! WARNING: {zero_grad} params have exactly-zero gradients — "
                 f"possible dead branches in CHNet"
             )
+            for zn in zero_names[:10]:
+                lines.append(f"    zero-grad: {zn}")
 
         # NaN in gradients
         nan_grad = sum(

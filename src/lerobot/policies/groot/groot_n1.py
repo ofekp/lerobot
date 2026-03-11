@@ -898,8 +898,15 @@ class GR00TN15(PreTrainedModel):
             # Print weights after HuggingFace loading (Stage 2 & 3 combined - HF creates and loads in one step)
             patch_embed = pretrained_model.backbone.eagle_model.vision_model.vision_model.embeddings.patch_embedding
             _print_patch_embed_weights(patch_embed.weight.data, "Stage 2+3: After HuggingFace from_pretrained (weights loaded)", use_depth)
-            
+
             # Now extend to 4 channels using rgb_average of the loaded pretrained weights
+
+        # Re-apply zero-init on cross-attention output projection.
+        # HF's _no_init_weights context patches nn.init.zeros_ to a no-op during
+        # model construction, so the zero-init in DepthCrossAttentionFusion.__init__
+        # is silently skipped. This call runs AFTER from_pretrained returns.
+        if hasattr(pretrained_model.backbone, 'chnet') and pretrained_model.backbone.chnet is not None:
+            pretrained_model.backbone.chnet.apply_zero_init()
 
         pretrained_model.backbone.set_trainable_parameters(tune_visual=tune_visual, tune_llm=tune_llm)
         pretrained_model.action_head.set_trainable_parameters(

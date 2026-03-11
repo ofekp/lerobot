@@ -327,6 +327,24 @@ class CHNetDepthProcessor(nn.Module):
             num_heads=num_heads,
         )
 
+    def apply_zero_init(self):
+        """Re-apply zero-init on cross-attention output projection.
+
+        Must be called AFTER HuggingFace from_pretrained() returns, because HF's
+        _no_init_weights context manager patches nn.init.zeros_ to a no-op during
+        model construction, silently preventing the zero-init in __init__.
+        """
+        out_proj = self.fusion.cross_attn.out_proj
+        nn.init.zeros_(out_proj.weight)
+        nn.init.zeros_(out_proj.bias)
+        w_norm = out_proj.weight.data.norm().item()
+        b_norm = out_proj.bias.data.norm().item()
+        print(
+            f"[CHNet] Zero-init applied to cross_attn.out_proj: "
+            f"weight norm={w_norm:.6f}, bias norm={b_norm:.6f} (both should be 0.0)",
+            flush=True,
+        )
+
     def forward(self, depth, vit_features, grid_h, grid_w, eagle_features,
                 return_diagnostics=False, n_image_tokens=None):
         """
