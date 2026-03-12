@@ -231,117 +231,96 @@ class DepthCNNEncoder(nn.Module):
         return x
 
 
-class DepthCrossAttentionFusion(nn.Module):
-    """Cross-attention to fuse depth features into ViT token sequence."""
+class DepthSpatialAddFusion(nn.Module):
+    """Spatially-aligned element-wise addition of depth features into eagle tokens.
 
-    def __init__(self, depth_channels, hidden_dim, num_heads=8):
+    Instead of cross-attention (which produces uniform attention over depth tokens),
+    this module upsamples depth CNN features to match the ViT patch grid and adds
+    them directly to the corresponding image tokens.
+
+    Depth token at grid (i, j) maps to ViT token i*grid_w + j within each view.
+    A learnable gate scalar (zero-initialized) controls blending strength.
+    """
+
+    def __init__(self, depth_channels, hidden_dim):
         super().__init__()
         self.depth_proj = nn.Linear(depth_channels, hidden_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim, num_heads=num_heads, batch_first=True
-        )
-        # Zero-init output projection so depth branch starts as identity.
-        # Combined with pre-norm residual (x + norm(attn_out)), this ensures
-        # change_ratio starts near 0 and depth signal blends in gradually.
-        nn.init.zeros_(self.cross_attn.out_proj.weight)
-        nn.init.zeros_(self.cross_attn.out_proj.bias)
-        self.norm = nn.LayerNorm(hidden_dim)
+        # Learnable gate starts at 0 → model begins identical to pretrained RGB-only
+        self.gate = nn.Parameter(torch.zeros(1))
 
-    def forward(self, eagle_features, depth_features, return_diagnostics=False,
-                n_image_tokens=None):
+    def forward(self, eagle_features, depth_features, n_image_tokens,
+                grid_h, grid_w, return_diagnostics=False):
         """
         Args:
             eagle_features: (B, seq_len, hidden_dim) from Eagle model
-            depth_features: (N, C, H, W) from DepthCNNEncoder, where N = B * num_views
-            return_diagnostics: if True, also return attention weights and depth tokens
-            n_image_tokens: if provided and < seq_len, only cross-attend image tokens
-                            (text tokens are passed through unchanged)
+            depth_features: (N, C, H_d, W_d) from DepthCNNEncoder (N = B * num_views)
+            n_image_tokens: number of image tokens in eagle sequence (= num_views * grid_h * grid_w)
+            grid_h, grid_w: ViT patch grid dimensions (typically 16, 16)
+            return_diagnostics: if True, also return depth tokens for visualization
         Returns:
             (B, seq_len, hidden_dim) enriched features
-            If return_diagnostics: tuple of (enriched_features, attn_weights, depth_tokens)
+            If return_diagnostics: tuple of (enriched_features, depth_tokens_projected)
         """
-        n, c, h, w = depth_features.shape
+        n, c, h_d, w_d = depth_features.shape
         b_eagle = eagle_features.shape[0]
-        seq_len = eagle_features.shape[1]
-        depth_tokens = depth_features.flatten(2).transpose(1, 2)  # (N, H*W, C)
-        depth_tokens = self.depth_proj(depth_tokens)  # (N, H*W, hidden_dim)
 
-        # Handle multi-view: when using multiple cameras, depth has N = B * num_views
-        # entries but eagle_features has only B. Merge view tokens so batch dims match.
+        # 1. Upsample depth features to match ViT spatial grid
+        if h_d != grid_h or w_d != grid_w:
+            depth_features = F.interpolate(
+                depth_features, size=(grid_h, grid_w), mode='bilinear', align_corners=False
+            )
+
+        # 2. Flatten spatial dims → token sequence: (N, grid_h*grid_w, C)
+        depth_tokens = depth_features.flatten(2).transpose(1, 2)
+
+        # 3. Project to eagle hidden dim: (N, grid_h*grid_w, hidden_dim)
+        depth_tokens = self.depth_proj(depth_tokens)
+
+        # 4. Merge views: (B*V, T, D) → (B, V*T, D)
         if n != b_eagle:
             num_views = n // b_eagle
             tokens_per_view = depth_tokens.shape[1]
-            # (B*V, T, D) -> (B, V*T, D) — each batch element attends to all its views
             depth_tokens = depth_tokens.view(b_eagle, num_views * tokens_per_view, -1)
 
-        # Slice image tokens from the full eagle sequence when n_image_tokens is given.
-        # Text tokens have no spatial correspondence to depth and produce uniform
-        # attention, so we only use the image portion as Q in cross-attention.
-        if n_image_tokens is not None and n_image_tokens < seq_len:
-            image_tokens = eagle_features[:, :n_image_tokens, :]
-            text_tokens = eagle_features[:, n_image_tokens:, :]
-        else:
-            image_tokens = eagle_features
-            text_tokens = None
+        # 5. Gated addition to image tokens only
+        result = eagle_features.clone()
+        result[:, :n_image_tokens] = (
+            eagle_features[:, :n_image_tokens] + self.gate * depth_tokens
+        )
 
-        # Cross-attention: Q=image_tokens, K=depth, V=depth
         if return_diagnostics:
-            attn_out, attn_weights = self.cross_attn(
-                query=image_tokens,
-                key=depth_tokens,
-                value=depth_tokens,
-                need_weights=True,
-                average_attn_weights=False,  # keep per-head weights
-            )
-            enriched_image = image_tokens + self.norm(attn_out)
-            if text_tokens is not None:
-                result = torch.cat([enriched_image, text_tokens], dim=1)
-            else:
-                result = enriched_image
-            return result, attn_weights, depth_tokens
-        else:
-            attn_out, _ = self.cross_attn(
-                query=image_tokens,
-                key=depth_tokens,
-                value=depth_tokens,
-            )
-            enriched_image = image_tokens + self.norm(attn_out)
-            if text_tokens is not None:
-                return torch.cat([enriched_image, text_tokens], dim=1)
-            return enriched_image
+            return result, depth_tokens
+        return result
 
 
 class CHNetDepthProcessor(nn.Module):
     """Orchestrates the full CHNet depth processing pipeline.
 
-    Combines DepthCNNEncoder + DepthCrossAttentionFusion.
+    Combines DepthCNNEncoder + DepthSpatialAddFusion.
     """
 
     def __init__(self, vit_dim=1024, hidden_dim=2048, channels=(64, 128, 256, 256),
                  num_heads=8):
         super().__init__()
         self.encoder = DepthCNNEncoder(vit_dim=vit_dim, channels=channels)
-        self.fusion = DepthCrossAttentionFusion(
+        self.fusion = DepthSpatialAddFusion(
             depth_channels=channels[-1],
             hidden_dim=hidden_dim,
-            num_heads=num_heads,
         )
 
     def apply_zero_init(self):
-        """Re-apply zero-init on cross-attention output projection.
+        """Re-apply zero-init on spatial fusion gate.
 
         Must be called AFTER HuggingFace from_pretrained() returns, because HF's
         _no_init_weights context manager patches nn.init.zeros_ to a no-op during
         model construction, silently preventing the zero-init in __init__.
         """
-        out_proj = self.fusion.cross_attn.out_proj
-        nn.init.zeros_(out_proj.weight)
-        nn.init.zeros_(out_proj.bias)
-        w_norm = out_proj.weight.data.norm().item()
-        b_norm = out_proj.bias.data.norm().item()
+        with torch.no_grad():
+            self.fusion.gate.zero_()
+        gate_val = self.fusion.gate.item()
         print(
-            f"[CHNet] Zero-init applied to cross_attn.out_proj: "
-            f"weight norm={w_norm:.6f}, bias norm={b_norm:.6f} (both should be 0.0)",
+            f"[CHNet] Zero-init applied to spatial fusion gate: "
+            f"value={gate_val:.6f} (should be 0.0)",
             flush=True,
         )
 
@@ -354,7 +333,7 @@ class CHNetDepthProcessor(nn.Module):
             grid_h, grid_w: ViT patch grid dimensions
             eagle_features: (B, seq_len, hidden_dim) pre-projection features
             return_diagnostics: if True, also return intermediate tensors for visualization
-            n_image_tokens: if provided, only cross-attend image tokens in fusion
+            n_image_tokens: number of image tokens in eagle sequence
         Returns:
             (B, seq_len, hidden_dim) enriched features
             If return_diagnostics: tuple of (enriched_features, diagnostics_dict)
@@ -363,12 +342,13 @@ class CHNetDepthProcessor(nn.Module):
             depth_feat, fastguide_attns, vit_projected, depth_stages = self.encoder(
                 depth, vit_features, grid_h, grid_w, return_diagnostics=True
             )
-            result, attn_weights, depth_tokens = self.fusion(
-                eagle_features, depth_feat, return_diagnostics=True,
+            result, depth_tokens = self.fusion(
+                eagle_features, depth_feat,
                 n_image_tokens=n_image_tokens,
+                grid_h=grid_h, grid_w=grid_w,
+                return_diagnostics=True,
             )
             return result, {
-                "attn_weights": attn_weights,
                 "fastguide_attns": fastguide_attns,
                 "depth_tokens": depth_tokens,
                 "vit_projected": vit_projected,
@@ -376,4 +356,8 @@ class CHNetDepthProcessor(nn.Module):
             }
         else:
             depth_feat = self.encoder(depth, vit_features, grid_h, grid_w)
-            return self.fusion(eagle_features, depth_feat, n_image_tokens=n_image_tokens)
+            return self.fusion(
+                eagle_features, depth_feat,
+                n_image_tokens=n_image_tokens,
+                grid_h=grid_h, grid_w=grid_w,
+            )
