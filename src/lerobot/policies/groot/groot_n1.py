@@ -915,9 +915,9 @@ class GR00TN15(PreTrainedModel):
 
             # Now extend to 4 channels using rgb_average of the loaded pretrained weights
 
-        # Re-apply zero-init on cross-attention output projection.
+        # Re-apply zero-init on spatial fusion gate.
         # HF's _no_init_weights context patches nn.init.zeros_ to a no-op during
-        # model construction, so the zero-init in DepthCrossAttentionFusion.__init__
+        # model construction, so the zero-init in DepthSpatialAddFusion.__init__
         # is silently skipped. This call runs AFTER from_pretrained returns.
         if hasattr(pretrained_model.backbone, 'chnet') and pretrained_model.backbone.chnet is not None:
             pretrained_model.backbone.chnet.apply_zero_init()
