@@ -519,7 +519,6 @@ class EagleBackbone(nn.Module):
                     depth_input=depth_normalized,
                     eagle_features_before=eagle_features_before,
                     eagle_features_after=eagle_features,
-                    attn_weights=diag_data["attn_weights"],
                     fastguide_attns=diag_data["fastguide_attns"],
                     depth_tokens=diag_data["depth_tokens"],
                     rgb_pixels=pixel_values,
@@ -530,6 +529,7 @@ class EagleBackbone(nn.Module):
                     n_image_tokens=n_image_tokens,
                     vit_projected=diag_data["vit_projected"],
                     depth_stages=diag_data["depth_stages"],
+                    gate_value=self.chnet.fusion.gate.item(),
                 )
                 self._diagnostics.report(self._depth_fwd_count, is_training=self.training)
             else:
@@ -547,11 +547,11 @@ class EagleBackbone(nn.Module):
             diff_norm = diff.norm().item()
             if eagle_features.abs().max().item() == 0.0:
                 raise RuntimeError(
-                    "[GROOT] CHNet output is all zeros! Cross-attention fusion produced empty features."
+                    "[GROOT] CHNet output is all zeros! Spatial fusion produced empty features."
                 )
-            # Zero-init on cross-attention out_proj means diff is exactly 0 before
-            # the first optimizer step. Only raise after enough steps for gradients
-            # to have updated the weights (batch_size steps ≈ 1 optimizer step).
+            # Zero-init gate means diff is exactly 0 before the first optimizer
+            # step. Only raise after enough steps for gradients to have updated
+            # the gate (batch_size steps ≈ 1 optimizer step).
             _WARMUP_STEPS = 50
             if diff_norm == 0.0:
                 if self._depth_fwd_count <= _WARMUP_STEPS:
@@ -563,7 +563,7 @@ class EagleBackbone(nn.Module):
                 else:
                     raise RuntimeError(
                         f"[GROOT] CHNet did not change eagle_features after {self._depth_fwd_count} steps! "
-                        "Cross-attention residual is still zero — depth signal is not being fused. "
+                        "Spatial fusion gate is still zero — depth signal is not being fused. "
                         "Check that CHNet parameters are receiving gradients."
                     )
 
