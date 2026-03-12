@@ -497,8 +497,8 @@ class DepthDiagnostics:
                             drift_pct = abs(current_norm - init_norm) / init_norm * 100
                         else:
                             drift_pct = 0.0 if abs(current_norm) < 1e-8 else float("inf")
-                        # Print top-level summary + out_proj (critical for zero-init verification)
-                        if name.count(".") <= 2 or "out_proj" in name:
+                        # Print top-level summary + gate (critical for zero-init verification)
+                        if name.count(".") <= 2 or "gate" in name:
                             lines.append(
                                 f"    {name:40s}: {drift_pct:6.2f}% drift  "
                                 f"(init={init_norm:.4f}, now={current_norm:.4f})  "
@@ -582,14 +582,11 @@ class DepthDiagnostics:
 
         # --- Step 1: verify zero-init actually took effect ---
         if step == 1:
-            out_proj = chnet.fusion.cross_attn.out_proj
-            w_norm = out_proj.weight.data.detach().float().norm().item()
-            b_norm = out_proj.bias.data.detach().float().norm().item()
+            gate_val = chnet.fusion.gate.data.item()
             print(
                 f"[CHNet Zero-Init Check @ step 1 BEFORE optimizer step]\n"
-                f"  out_proj.weight norm: {w_norm:.8f}  (should be 0.0)\n"
-                f"  out_proj.bias   norm: {b_norm:.8f}  (should be 0.0)\n"
-                f"  {'OK — zero-init confirmed' if w_norm < 1e-7 and b_norm < 1e-7 else '!! FAILED — weights are NOT zero, HF _no_init_weights likely overwrote them'}",
+                f"  gate value: {gate_val:.8f}  (should be 0.0)\n"
+                f"  {'OK — zero-init confirmed' if abs(gate_val) < 1e-7 else '!! FAILED — gate is NOT zero, HF _no_init_weights likely overwrote it'}",
                 flush=True,
             )
 
