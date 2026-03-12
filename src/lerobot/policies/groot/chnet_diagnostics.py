@@ -317,10 +317,10 @@ class DepthDiagnostics:
     # Collect tensors
     # ------------------------------------------------------------------
     def collect(self, step, depth_input, eagle_features_before, eagle_features_after,
-                attn_weights=None, fastguide_attns=None, depth_tokens=None,
+                fastguide_attns=None, depth_tokens=None,
                 rgb_pixels=None, is_training=True,
                 grid_h=None, grid_w=None, num_views=1, n_image_tokens=None,
-                vit_projected=None, depth_stages=None):
+                vit_projected=None, depth_stages=None, gate_value=None):
         """Collect tensors for diagnostics. All are detached to CPU float32.
 
         Args:
@@ -328,9 +328,8 @@ class DepthDiagnostics:
             depth_input: (B, 1, H, W) normalized depth.
             eagle_features_before: (B, seq, D) eagle features before CHNet.
             eagle_features_after: (B, seq, D) eagle features after CHNet.
-            attn_weights: Optional (B, heads, seq_q, seq_kv) cross-attention weights.
             fastguide_attns: Optional list of 4 (B, 1, H, W) spatial attention maps.
-            depth_tokens: Optional (B, N, D) depth tokens fed to cross-attention.
+            depth_tokens: Optional (B, N, D) depth tokens from spatial fusion.
             rgb_pixels: Optional (B, 3, H, W) RGB input pixels.
             is_training: Whether we are in training mode.
             grid_h: ViT patch grid height.
@@ -340,6 +339,7 @@ class DepthDiagnostics:
             vit_projected: Optional list of 4 (B, C, H, W) projected ViT feature maps.
             depth_stages: Optional list of 4 (B, C, H, W) depth CNN stage features
                           before FastGuide.
+            gate_value: Optional float — current value of the spatial fusion gate.
         """
         self._collected = {
             "step": step,
@@ -347,7 +347,6 @@ class DepthDiagnostics:
             "depth_input": _safe_detach(depth_input),
             "eagle_before": _safe_detach(eagle_features_before),
             "eagle_after": _safe_detach(eagle_features_after),
-            "attn_weights": _safe_detach(attn_weights),
             "fastguide_attns": [_safe_detach(a) for a in fastguide_attns] if fastguide_attns else None,
             "depth_tokens": _safe_detach(depth_tokens),
             "rgb_pixels": _safe_detach(rgb_pixels),
@@ -357,6 +356,7 @@ class DepthDiagnostics:
             "n_image_tokens": n_image_tokens,
             "vit_projected": [_safe_detach(v) for v in vit_projected] if vit_projected else None,
             "depth_stages": [_safe_detach(d) for d in depth_stages] if depth_stages else None,
+            "gate_value": gate_value,
         }
 
     # ------------------------------------------------------------------
@@ -465,27 +465,15 @@ class DepthDiagnostics:
             if torch.isinf(eagle_after).any():
                 lines.append("  !! CRITICAL: eagle_features AFTER CHNet contain Inf — CHNet is exploding!")
 
-        # 2. Cross-attention entropy (is depth being used or ignored?)
-        attn = self._collected.get("attn_weights")
-        if attn is not None:
-            # attn: (B, heads, seq_q, seq_kv) — compute entropy over depth tokens (last dim)
-            attn_b0 = attn[0]  # (heads, seq_q, seq_kv)
-            # Clamp for numerical safety
-            attn_probs = attn_b0.clamp(min=1e-8)
-            entropy = -(attn_probs * attn_probs.log()).sum(dim=-1).mean().item()
-            max_entropy = np.log(attn_b0.shape[-1])
-            entropy_ratio = entropy / max_entropy if max_entropy > 0 else 0.0
-            n_image_tokens = self._collected.get("n_image_tokens")
-            num_views_h = self._collected.get("num_views", 1)
+        # 2. Spatial fusion gate value
+        gate_val = self._collected.get("gate_value")
+        if gate_val is not None:
             lines.append(
-                f"  attn_entropy      : {entropy:.3f} / {max_entropy:.3f} "
-                f"(ratio={entropy_ratio:.3f}, Q={attn_b0.shape[1]} img tokens, "
-                f"K={attn_b0.shape[2]} depth tokens = {num_views_h}x7x7)"
+                f"  gate_value        : {gate_val:.6f}  "
+                f"(expected: 0.0 at init, growing during training)"
             )
-            if entropy_ratio > 0.95:
-                lines.append("  !! WARNING: attention is near-uniform — depth tokens not discriminated!")
-            elif entropy_ratio < 0.1:
-                lines.append("  !! WARNING: attention is collapsed to few tokens — possible degenerate fusion!")
+            if abs(gate_val) < 1e-8 and step > 50:
+                lines.append("  !! WARNING: gate is still ~0 after warmup — depth signal may not be learning!")
 
         # 3. Weight norms
         backbone = self.model
